@@ -1,40 +1,70 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+from .config import LLMConfig
+from .types import LLMRequest
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    """
+    Provider-independent response returned by every LLM.
+    """
+
+    text: str
+    model: str | None = None
+    provider: str | None = None
 
 
 class BaseLLM(ABC):
     """
     Common interface for all LLM providers.
 
-    The application talks only to this interface.
-    Provider-specific SDK logic stays inside each
-    provider implementation.
+    Supports both:
+
+        BaseLLM(config)
+
+    and the legacy:
+
+        BaseLLM(api_key="...", model="...")
+
+    The compatibility layer allows the existing application
+    and tests to continue working while the provider architecture
+    remains model-agnostic.
     """
 
     def __init__(
         self,
-        api_key: str,
-        model: str,
+        config: LLMConfig | None = None,
+        *,
+        api_key: str = "",
+        model: str = "",
     ):
-        self.api_key = api_key
-        self.model = model
+        if config is None:
+            config = LLMConfig(
+                provider=self.__class__.__name__.replace(
+                    "LLM",
+                    "",
+                ).lower(),
+                model=model,
+                api_key=api_key,
+            )
+
+        self.config = config
+
+        self.api_key = config.api_key
+        self.model = config.model
 
     @abstractmethod
     def generate(
         self,
-        messages: list[dict],
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-    ) -> str:
+        request: LLMRequest,
+    ) -> LLMResponse:
         """
-        Generate a response from the LLM.
+        Generate a provider-independent response.
 
-        Args:
-            messages: Chat messages using the common format.
-            temperature: Optional generation temperature.
-            max_tokens: Optional maximum output tokens.
-
-        Returns:
-            Generated text.
+        Provider-specific SDK response objects must never
+        leave the provider adapter.
         """
 
         raise NotImplementedError

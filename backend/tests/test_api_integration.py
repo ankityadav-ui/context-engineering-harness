@@ -64,25 +64,31 @@ from fastapi.testclient import TestClient
 # ============================================================
 
 class FakeLLM:
-    """A fake LLM that inspects context and returns controlled answers."""
+    """A fake LLM that inspects context and returns controlled answers.
+
+    Accepts LLMRequest objects (the provider-agnostic interface).
+    """
 
     def __init__(self, default_answer="Mock answer"):
         self.default_answer = default_answer
         self.last_messages = None
 
-    def generate(self, messages, temperature=None, max_tokens=None):
+    def generate(self, request):
+        from app.llm.base import LLMResponse
+
+        messages = request.messages
         self.last_messages = messages
         # Extract context from system message to give smarter answers
         system = messages[0]["content"] if messages else ""
         user = messages[-1]["content"] if messages else ""
 
         if "LLM fine tuning" in system or "LLM fine tuning" in user:
-            return "You are currently learning LLM fine-tuning."
+            return LLMResponse(text="You are currently learning LLM fine-tuning.")
         if "CSL422" in system or "Machine Learning" in system:
-            return "The course code for Machine Learning is CSL422. You are currently learning LLM fine-tuning."
+            return LLMResponse(text="The course code for Machine Learning is CSL422. You are currently learning LLM fine-tuning.")
         if "FastAPI" in system:
-            return "You mentioned using FastAPI."
-        return self.default_answer
+            return LLMResponse(text="You mentioned using FastAPI.")
+        return LLMResponse(text=self.default_answer)
 
 
 fake_llm = FakeLLM()

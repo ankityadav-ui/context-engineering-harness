@@ -1,4 +1,7 @@
+from collections.abc import Callable
+
 from .base import BaseLLM
+from .config import LLMConfig
 from .gemini import GeminiLLM
 from .groq import GroqLLM
 from .mistral import MistralLLM
@@ -12,57 +15,92 @@ from ..config import (
 )
 
 
+LLMProviderFactory = Callable[[LLMConfig], BaseLLM]
+
+
+def _create_mock(config: LLMConfig) -> BaseLLM:
+    return MockLLM(config)
+
+
+def _create_gemini(config: LLMConfig) -> BaseLLM:
+    return GeminiLLM(config)
+
+
+def _create_groq(config: LLMConfig) -> BaseLLM:
+    return GroqLLM(config)
+
+
+def _create_mistral(config: LLMConfig) -> BaseLLM:
+    return MistralLLM(config)
+
+
+def _create_openrouter(config: LLMConfig) -> BaseLLM:
+    return OpenRouterLLM(config)
+
+
+LLM_PROVIDERS: dict[str, LLMProviderFactory] = {
+    "mock": _create_mock,
+    "gemini": _create_gemini,
+    "groq": _create_groq,
+    "mistral": _create_mistral,
+    "openrouter": _create_openrouter,
+}
+
+
+PROVIDERS_REQUIRING_API_KEY = {
+    "gemini",
+    "groq",
+    "mistral",
+    "openrouter",
+}
+
+
 def create_llm(
     provider: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
 ) -> BaseLLM:
+    """
+    Create an LLM implementation using the configured provider.
 
-    provider = (provider or LLM_PROVIDER).lower().strip()
-    api_key = api_key or LLM_API_KEY
-    model = model or LLM_MODEL
+    Application code depends only on BaseLLM.
+    Provider-specific construction is isolated here.
+    """
 
-    if provider == "mock":
-        return MockLLM(
-            api_key=api_key or "",
-            model=model,
-        )
+    provider_name = (
+        provider or LLM_PROVIDER
+    ).lower().strip()
 
-    if provider == "gemini":
-        if not api_key:
-            raise ValueError("Gemini API key is not configured")
+    selected_api_key = api_key or LLM_API_KEY
+    selected_model = model or LLM_MODEL
 
-        return GeminiLLM(
-            api_key=api_key,
-            model=model,
-        )
-
-    if provider == "groq":
-        if not api_key:
-            raise ValueError("Groq API key is not configured")
-
-        return GroqLLM(
-            api_key=api_key,
-            model=model,
-        )
-
-    if provider == "mistral":
-        if not api_key:
-            raise ValueError("Mistral API key is not configured")
-
-        return MistralLLM(
-            api_key=api_key,
-            model=model,
-        )
-    if provider == "openrouter":
-        if not api_key:
-            raise ValueError("OpenRouter API key is not configured")
-
-        return OpenRouterLLM(
-            api_key=api_key,
-            model=model,
-        )
-
-    raise ValueError(
-        f"Unsupported LLM provider: {provider}"
+    provider_factory = LLM_PROVIDERS.get(
+        provider_name
     )
+
+    if provider_factory is None:
+        supported = ", ".join(
+            sorted(LLM_PROVIDERS)
+        )
+
+        raise ValueError(
+            f"Unsupported LLM provider: {provider_name}. "
+            f"Supported providers: {supported}"
+        )
+
+    if (
+        provider_name in PROVIDERS_REQUIRING_API_KEY
+        and not selected_api_key
+    ):
+        raise ValueError(
+            f"{provider_name.capitalize()} "
+            f"API key is not configured"
+        )
+
+    config = LLMConfig(
+        provider=provider_name,
+        model=selected_model,
+        api_key=selected_api_key or "",
+    )
+
+    return provider_factory(config)

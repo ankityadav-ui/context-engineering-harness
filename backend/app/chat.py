@@ -2,6 +2,8 @@ from sqlalchemy.orm import Session
 
 from .context_engine import build_context
 from .llm.factory import create_llm
+from .llm.retry import with_retry
+from .llm.types import LLMRequest
 from .memory import build_memory_context
 
 
@@ -79,6 +81,46 @@ def _get_memory_context(
 
 
 # ============================================================
+# LLM
+# ============================================================
+
+def _generate_llm_response(
+    messages: list[dict],
+) -> str:
+    """
+    Generate a response through the provider-independent
+    LLM abstraction.
+
+    The rest of the application does not know whether the
+    configured provider is Gemini, Groq, Mistral, OpenRouter,
+    or Mock.
+
+    Transient failures (timeouts, rate-limits, temporary server
+    errors) are automatically retried according to the
+    project's retry configuration.
+    """
+
+    from .config import (
+        LLM_MAX_RETRIES,
+        LLM_RETRY_DELAY_SECONDS,
+    )
+
+    llm = create_llm()
+
+    request = LLMRequest(
+        messages=messages,
+    )
+
+    response = with_retry(
+        lambda: llm.generate(request),
+        max_retries=LLM_MAX_RETRIES,
+        delay=LLM_RETRY_DELAY_SECONDS,
+    )
+
+    return response.text
+
+
+# ============================================================
 # NORMAL CHAT
 # ============================================================
 
@@ -99,7 +141,7 @@ def generate_normal_answer(
                 ↓
         Unified Context Engine
                 ↓
-        LLM
+        Provider-independent LLM interface
                 ↓
         Answer
     """
@@ -127,10 +169,8 @@ def generate_normal_answer(
     context = context_result["context"]
 
     # --------------------------------------------------------
-    # Create LLM
+    # Build system prompt
     # --------------------------------------------------------
-
-    llm = create_llm()
 
     system_content = NORMAL_SYSTEM_PROMPT
 
@@ -151,21 +191,22 @@ def generate_normal_answer(
         {
             "role": "system",
             "content": system_content,
-        }
-    ]
-
-    messages.append(
+        },
         {
             "role": "user",
             "content": query,
-        }
-    )
+        },
+    ]
 
     # --------------------------------------------------------
-    # Generate answer
+    # Generate answer through BaseLLM
     # --------------------------------------------------------
 
-    answer = llm.generate(messages)
+    answer = _generate_llm_response(messages)
+
+    # --------------------------------------------------------
+    # Return result
+    # --------------------------------------------------------
 
     return {
         "query": query,
@@ -210,7 +251,7 @@ def generate_rag_answer(
                 ↓
         Unified Context Engine
                 ↓
-        Main LLM
+        Provider-independent LLM interface
                 ↓
         Answer
     """
@@ -259,14 +300,14 @@ def generate_rag_answer(
         [],
     )
 
-    # --------------------------------------------------------
-    # No relevant context
-    # --------------------------------------------------------
-
     long_term_memory = sources.get(
         "long_term_memory",
         "",
     )
+
+    # --------------------------------------------------------
+    # No relevant context
+    # --------------------------------------------------------
 
     if not chunks and not graph_results and not long_term_memory:
         return {
@@ -283,13 +324,7 @@ def generate_rag_answer(
         }
 
     # --------------------------------------------------------
-    # Create configured LLM
-    # --------------------------------------------------------
-
-    llm = create_llm()
-
-    # --------------------------------------------------------
-    # System prompt
+    # Build system prompt
     # --------------------------------------------------------
 
     system_content = SYSTEM_PROMPT
@@ -319,10 +354,10 @@ def generate_rag_answer(
     ]
 
     # --------------------------------------------------------
-    # Generate answer
+    # Generate answer through BaseLLM
     # --------------------------------------------------------
 
-    answer = llm.generate(messages)
+    answer = _generate_llm_response(messages)
 
     # --------------------------------------------------------
     # Return complete result

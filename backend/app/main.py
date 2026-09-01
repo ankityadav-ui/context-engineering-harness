@@ -1,6 +1,13 @@
 import os
 import shutil
 from .chat import generate_rag_answer, generate_normal_answer
+from .llm.exceptions import (
+    LLMAuthenticationError,
+    LLMConfigurationError,
+    LLMProviderError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+)
 from .memory import (
     create_memory,
     list_memories,
@@ -1322,10 +1329,30 @@ def chat(
             db=db,
         )
 
-    except Exception as error:
+    except LLMAuthenticationError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM authentication failed: {error}"
+        )
+    except LLMRateLimitError as error:
+        raise HTTPException(
+            status_code=429,
+            detail=f"LLM rate limit exceeded: {error}"
+        )
+    except LLMTimeoutError as error:
+        raise HTTPException(
+            status_code=504,
+            detail=f"LLM request timed out: {error}"
+        )
+    except LLMConfigurationError as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Chat generation failed: {error}"
+            detail=f"LLM configuration error: {error}"
+        )
+    except LLMProviderError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM provider error: {error}"
         )
 
     # --------------------------------------------------------
@@ -1571,10 +1598,30 @@ def send_chat_message(
                 memory_context=memory_context,
             )
 
-    except Exception as error:
+    except LLMAuthenticationError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM authentication failed: {error}"
+        )
+    except LLMRateLimitError as error:
+        raise HTTPException(
+            status_code=429,
+            detail=f"LLM rate limit exceeded: {error}"
+        )
+    except LLMTimeoutError as error:
+        raise HTTPException(
+            status_code=504,
+            detail=f"LLM request timed out: {error}"
+        )
+    except LLMConfigurationError as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Chat generation failed: {error}"
+            detail=f"LLM configuration error: {error}"
+        )
+    except LLMProviderError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM provider error: {error}"
         )
 
     # --------------------------------------------------------
