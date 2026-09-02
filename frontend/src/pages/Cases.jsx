@@ -12,7 +12,8 @@ import {
   MessageSquare,
   X,
 } from "lucide-react";
-import { API_URL } from "../config";
+import { casesApi } from "../api/cases";
+import { ApiError } from "../api/client";
 
 function Cases() {
   const [cases, setCases] = useState([]);
@@ -39,11 +40,14 @@ function Cases() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(API_URL + "/cases");
-      if (!res.ok) throw new Error("Failed to load cases");
-      setCases(await res.json());
+      const data = await casesApi.list();
+      setCases(data);
     } catch (err) {
-      setError(err.message || "Failed to load cases");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to load cases");
+      }
     } finally {
       setLoading(false);
     }
@@ -56,26 +60,21 @@ function Cases() {
     setError("");
     setSuccess("");
     try {
-      const res = await fetch(API_URL + "/cases", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: newName.trim(),
-          description: newDescription.trim() || null,
-        }),
+      const created = await casesApi.create({
+        name: newName.trim(),
+        description: newDescription.trim() || null,
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to create case");
-      }
-      const created = await res.json();
       setCases((prev) => [created, ...prev]);
       setSuccess("Case created successfully");
       setNewName("");
       setNewDescription("");
       setShowForm(false);
     } catch (err) {
-      setError(err.message || "Failed to create case");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to create case");
+      }
     } finally {
       setCreating(false);
     }
@@ -86,17 +85,15 @@ function Cases() {
     setError("");
     setSuccess("");
     try {
-      const res = await fetch(API_URL + "/cases/" + caseId, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to delete case");
-      }
+      await casesApi.delete(caseId);
       setCases((prev) => prev.filter((c) => c.id !== caseId));
       setSuccess("Case deleted successfully");
     } catch (err) {
-      setError(err.message || "Failed to delete case");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to delete case");
+      }
     }
   };
 

@@ -13,7 +13,9 @@ import {
   CheckCircle,
   File,
 } from "lucide-react";
-import { API_URL } from "../config";
+import { casesApi } from "../api/cases";
+import { documentsApi } from "../api/documents";
+import { ApiError } from "../api/client";
 const SUPPORTED_TYPES = [".pdf", ".txt", ".docx"];
 
 function Documents() {
@@ -45,13 +47,10 @@ function Documents() {
 
   const loadCases = async () => {
     try {
-      const res = await fetch(API_URL + "/cases");
-      if (res.ok) {
-        const data = await res.json();
-        setCases(data);
-        if (data.length > 0 && !caseId) {
-          setCaseId(String(data[0].id));
-        }
+      const data = await casesApi.list();
+      setCases(data);
+      if (data.length > 0 && !caseId) {
+        setCaseId(String(data[0].id));
       }
     } catch (err) { console.error("Failed to load cases:", err); }
   };
@@ -60,10 +59,15 @@ function Documents() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(API_URL + "/cases/" + caseId + "/documents");
-      if (!res.ok) throw new Error("Failed to load documents");
-      setDocuments(await res.json());
-    } catch (err) { setError(err.message || "Failed to load documents"); }
+      const data = await documentsApi.list(caseId);
+      setDocuments(data);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to load documents");
+      }
+    }
     finally { setLoading(false); }
   };
 
@@ -73,13 +77,18 @@ function Documents() {
     setChunks([]);
     setExpandedChunks({});
     try {
-      const res = await fetch(API_URL + "/cases/" + caseId + "/documents/" + docId);
-      if (!res.ok) throw new Error("Failed to load document details");
-      setDocDetails(await res.json());
-    } catch (err) { setError(err.message || "Failed to load document details"); }
+      const data = await documentsApi.getDetails(caseId, docId);
+      setDocDetails(data);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to load document details");
+      }
+    }
     try {
-      const res = await fetch(API_URL + "/cases/" + caseId + "/documents/" + docId + "/chunks");
-      if (res.ok) { const d = await res.json(); setChunks(d.chunks || []); }
+      const data = await documentsApi.getChunks(caseId, docId);
+      setChunks(data.chunks || []);
     } catch (err) { console.error("Failed to load chunks:", err); }
   };
 
@@ -94,14 +103,16 @@ function Documents() {
     setError("");
     setSuccess("");
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      const res = await fetch(API_URL + "/cases/" + caseId + "/documents", { method: "POST", body: formData });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Upload failed");
+      const data = await documentsApi.upload(caseId, file);
       setSuccess("Uploaded " + file.name + " (" + data.chunk_count + " chunks)");
       loadDocuments();
-    } catch (err) { setError(err.message || "Upload failed"); }
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Upload failed");
+      }
+    }
     finally { setUploading(false); }
   };
 
@@ -110,12 +121,17 @@ function Documents() {
     setError("");
     setSuccess("");
     try {
-      const res = await fetch(API_URL + "/cases/" + caseId + "/documents/" + docId, { method: "DELETE" });
-      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Delete failed"); }
+      await documentsApi.delete(caseId, docId);
       setSuccess("Deleted " + filename);
       if (selectedDoc === docId) { setSelectedDoc(null); setDocDetails(null); setChunks([]); }
       loadDocuments();
-    } catch (err) { setError(err.message || "Delete failed"); }
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Delete failed");
+      }
+    }
   };
 
   const handleDragOver = (e) => { e.preventDefault(); setDragOver(true); };

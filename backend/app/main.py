@@ -8,6 +8,7 @@ from .llm.exceptions import (
     LLMRateLimitError,
     LLMTimeoutError,
 )
+from .llm.factory import LLM_PROVIDERS, PROVIDERS_REQUIRING_API_KEY
 from .memory import (
     create_memory,
     list_memories,
@@ -1835,4 +1836,171 @@ def delete_memory_endpoint(
 
     return {
         "message": "Memory deleted successfully"
+    }
+
+
+# ============================================================
+# LLM SETTINGS
+# ============================================================
+
+AVAILABLE_PROVIDERS = {
+    "gemini": {
+        "name": "Gemini",
+        "models": [
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+        ],
+        "default_model": "gemini-2.0-flash",
+    },
+    "groq": {
+        "name": "Groq",
+        "models": [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+        ],
+        "default_model": "llama-3.3-70b-versatile",
+    },
+    "mistral": {
+        "name": "Mistral",
+        "models": [
+            "mistral-large-latest",
+            "mistral-small-latest",
+            "open-mixtral-8x22b",
+        ],
+        "default_model": "mistral-large-latest",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "models": [
+            "anthropic/claude-3.5-sonnet",
+            "openai/gpt-4o",
+            "meta-llama/llama-3.1-70b-instruct",
+        ],
+        "default_model": "anthropic/claude-3.5-sonnet",
+    },
+}
+
+
+def _read_env_file() -> dict[str, str]:
+    """Read the .env file into a dict."""
+    env_path = os.path.join(
+        os.path.dirname(__file__), "..", ".env"
+    )
+    result = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    result[key.strip()] = value.strip()
+    return result
+
+
+def _write_env_file(updates: dict[str, str]) -> None:
+    """Update specific keys in the .env file."""
+    env_path = os.path.join(
+        os.path.dirname(__file__), "..", ".env"
+    )
+    existing = _read_env_file()
+    existing.update(updates)
+
+    lines = []
+    for key, value in existing.items():
+        lines.append(f"{key}={value}")
+
+    with open(env_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _update_runtime_config(
+    provider: str,
+    model: str,
+) -> None:
+    """Update the in-memory config so new requests use
+    the new provider/model without server restart."""
+    import app.config as cfg
+    import app.llm.factory as factory_mod
+
+    cfg.LLM_PROVIDER = provider
+    cfg.LLM_MODEL = model
+    cfg.LLM_API_KEY = cfg.LLM_API_KEY_MAP.get(provider)
+
+    factory_mod.LLM_PROVIDER = provider
+    factory_mod.LLM_MODEL = model
+    factory_mod.LLM_API_KEY = cfg.LLM_API_KEY
+
+
+@app.get("/settings/llm/providers")
+def get_llm_providers():
+    """Return available LLM providers and their models."""
+    return {
+        "providers": AVAILABLE_PROVIDERS,
+    }
+
+
+@app.get("/settings/llm")
+def get_llm_settings():
+    """Return current LLM provider and model."""
+    import app.config as cfg
+
+    return {
+        "provider": cfg.LLM_PROVIDER,
+        "model": cfg.LLM_MODEL,
+    }
+
+
+@app.put("/settings/llm")
+def update_llm_settings(data: dict):
+    """Update LLM provider and model.
+
+    Persists to .env and updates runtime config.
+    """
+    import app.config as cfg
+
+    provider = data.get("provider", "")
+    model = data.get("model", "")
+
+    if not provider:
+        raise HTTPException(
+            status_code=400,
+            detail="Provider is required"
+        )
+
+    if provider not in AVAILABLE_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported provider: {provider}"
+        )
+
+    if not model:
+        model = AVAILABLE_PROVIDERS[provider][
+            "default_model"
+        ]
+
+    valid_models = AVAILABLE_PROVIDERS[provider]["models"]
+    if model not in valid_models:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid model '{model}' for {provider}. "
+                f"Valid models: {valid_models}"
+            )
+        )
+
+    # Persist to .env
+    _write_env_file({
+        "LLM_PROVIDER": provider,
+        "LLM_MODEL": model,
+    })
+
+    # Update runtime config
+    _update_runtime_config(provider, model)
+
+    return {
+        "message": f"LLM settings updated to {provider}/{model}",
+        "provider": provider,
+        "model": model,
     }

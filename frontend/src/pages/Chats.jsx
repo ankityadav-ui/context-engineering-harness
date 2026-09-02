@@ -14,7 +14,9 @@ import {
   MessageCircle,
   X,
 } from "lucide-react";
-import { API_URL } from "../config";
+import { casesApi } from "../api/cases";
+import { chatsApi } from "../api/chats";
+import { ApiError } from "../api/client";
 
 function Chats() {
   const [caseId, setCaseId] = useState("");
@@ -50,13 +52,10 @@ function Chats() {
 
   const loadCases = async () => {
     try {
-      const response = await fetch(API_URL + "/cases");
-      if (response.ok) {
-        const data = await response.json();
-        setCases(data);
-        if (data.length > 0 && !caseId) {
-          setCaseId(String(data[0].id));
-        }
+      const data = await casesApi.list();
+      setCases(data);
+      if (data.length > 0 && !caseId) {
+        setCaseId(String(data[0].id));
       }
     } catch (err) {
       console.error("Failed to load cases:", err);
@@ -72,11 +71,8 @@ function Chats() {
   const loadSessions = async () => {
     setSessionsLoading(true);
     try {
-      const response = await fetch(API_URL + "/cases/" + caseId + "/chats");
-      if (response.ok) {
-        const data = await response.json();
-        setSessions(data);
-      }
+      const data = await chatsApi.listSessions(caseId);
+      setSessions(data);
     } catch (err) {
       console.error("Failed to load sessions:", err);
     } finally {
@@ -88,11 +84,7 @@ function Chats() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(API_URL + "/chats/" + chatId);
-      if (!response.ok) {
-        throw new Error("Failed to load chat history");
-      }
-      const data = await response.json();
+      const data = await chatsApi.getHistory(chatId);
       const loadedMessages = data.messages.map((msg) => ({
         role: msg.role,
         content: msg.content,
@@ -100,7 +92,11 @@ function Chats() {
       }));
       setMessages(loadedMessages);
     } catch (err) {
-      setError(err.message || "Failed to load chat history");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to load chat history");
+      }
     } finally {
       setLoading(false);
     }
@@ -110,20 +106,19 @@ function Chats() {
     setError("");
     setShowModePicker(false);
     try {
-      const response = await fetch(API_URL + "/cases/" + caseId + "/chats", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "New Chat", chat_mode: mode }),
+      const newSession = await chatsApi.createSession(caseId, {
+        title: "New Chat",
+        chat_mode: mode,
       });
-      if (!response.ok) {
-        throw new Error("Failed to create chat session");
-      }
-      const newSession = await response.json();
       setSessions((prev) => [newSession, ...prev]);
       setActiveSessionId(newSession.id);
       setMessages([]);
     } catch (err) {
-      setError(err.message || "Failed to create chat session");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to create chat session");
+      }
     }
   };
 
@@ -131,19 +126,18 @@ function Chats() {
     event.stopPropagation();
     setError("");
     try {
-      const response = await fetch(API_URL + "/chats/" + sessionId, {
-        method: "DELETE",
-      });
-      if (!response.ok) {
-        throw new Error("Failed to delete chat session");
-      }
+      await chatsApi.deleteSession(sessionId);
       setSessions((prev) => prev.filter((s) => s.id !== sessionId));
       if (activeSessionId === sessionId) {
         setActiveSessionId(null);
         setMessages([]);
       }
     } catch (err) {
-      setError(err.message || "Failed to delete chat session");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to delete chat session");
+      }
     }
   };
 
@@ -155,21 +149,19 @@ function Chats() {
     let currentSessionId = activeSessionId;
     if (!currentSessionId) {
       try {
-        const response = await fetch(API_URL + "/cases/" + caseId + "/chats", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: userMessage.substring(0, 50) + (userMessage.length > 50 ? "..." : ""),
-            chat_mode: selectedMode,
-          }),
+        const newSession = await chatsApi.createSession(caseId, {
+          title: userMessage.substring(0, 50) + (userMessage.length > 50 ? "..." : ""),
+          chat_mode: selectedMode,
         });
-        if (!response.ok) throw new Error("Failed to create chat session");
-        const newSession = await response.json();
         setSessions((prev) => [newSession, ...prev]);
         currentSessionId = newSession.id;
         setActiveSessionId(currentSessionId);
       } catch (err) {
-        setError(err.message || "Failed to create chat session");
+        if (err instanceof ApiError) {
+          setError(err.getUserMessage());
+        } else {
+          setError(err.message || "Failed to create chat session");
+        }
         return;
       }
     }
@@ -180,21 +172,19 @@ function Chats() {
     setLoading(true);
 
     try {
-      const response = await fetch(API_URL + "/chats/" + currentSessionId + "/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: userMessage }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Failed to generate response");
-      }
+      const data = await chatsApi.sendMessage(currentSessionId, userMessage);
       setMessages((previous) => [...previous, { role: "assistant", content: data.content, sources: data.sources || [], chunk_count: data.chunk_count || 0, metadata: data.metadata || null }]);
       setSessions((prev) =>
         prev.map((s) => (s.id === currentSessionId ? { ...s, updated_at: new Date().toISOString() } : s))
       );
     } catch (err) {
-      setError(err.message || "Unable to connect to the backend.");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else if (err instanceof TypeError && err.message.includes("fetch")) {
+        setError("Unable to connect to the backend. Please check if the server is running.");
+      } else {
+        setError(err.message || "Unable to connect to the backend.");
+      }
     } finally {
       setLoading(false);
     }

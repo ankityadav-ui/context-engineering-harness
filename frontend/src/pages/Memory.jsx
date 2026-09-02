@@ -14,7 +14,8 @@ import {
   Save,
   Info,
 } from "lucide-react";
-import { API_URL } from "../config";
+import { memoryApi } from "../api/memory";
+import { ApiError } from "../api/client";
 
 const MEMORY_TYPES = [
   { value: "fact", label: "Fact", color: "blue" },
@@ -54,11 +55,14 @@ function Memory() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(API_URL + "/memories");
-      if (!res.ok) throw new Error("Failed to load memories");
-      setMemories(await res.json());
+      const data = await memoryApi.list();
+      setMemories(data);
     } catch (err) {
-      setError(err.message || "Failed to load memories");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to load memories");
+      }
     } finally {
       setLoading(false);
     }
@@ -71,19 +75,11 @@ function Memory() {
     setError("");
     setSuccess("");
     try {
-      const res = await fetch(API_URL + "/memories", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: newContent.trim(),
-          memory_type: newType,
-          importance: newImportance,
-        }),
+      await memoryApi.create({
+        content: newContent.trim(),
+        memory_type: newType,
+        importance: newImportance,
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to create memory");
-      }
       setSuccess("Memory created successfully");
       setNewContent("");
       setNewType("fact");
@@ -91,7 +87,11 @@ function Memory() {
       setShowForm(false);
       await loadMemories();
     } catch (err) {
-      setError(err.message || "Failed to create memory");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to create memory");
+      }
     } finally {
       setCreating(false);
     }
@@ -116,24 +116,20 @@ function Memory() {
     setError("");
     setSuccess("");
     try {
-      const res = await fetch(API_URL + "/memories/" + memoryId, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: editContent.trim(),
-          memory_type: editType,
-          importance: editImportance,
-        }),
+      await memoryApi.update(memoryId, {
+        content: editContent.trim(),
+        memory_type: editType,
+        importance: editImportance,
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to update memory");
-      }
       setSuccess("Memory updated successfully");
       setEditingId(null);
       await loadMemories();
     } catch (err) {
-      setError(err.message || "Failed to update memory");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to update memory");
+      }
     }
   };
 
@@ -142,17 +138,15 @@ function Memory() {
     setError("");
     setSuccess("");
     try {
-      const res = await fetch(API_URL + "/memories/" + memoryId, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to delete memory");
-      }
+      await memoryApi.delete(memoryId);
       setSuccess("Memory deleted successfully");
       await loadMemories();
     } catch (err) {
-      setError(err.message || "Failed to delete memory");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to delete memory");
+      }
     }
   };
 

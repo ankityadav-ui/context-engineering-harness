@@ -1,4 +1,9 @@
 import {
+  useState,
+  useEffect,
+} from "react";
+
+import {
   Plus,
   MessageSquare,
   FolderOpen,
@@ -21,6 +26,8 @@ import {
   useLocation,
 } from "react-router-dom";
 
+import { api } from "./api/client";
+
 import Playground from "./pages/Playground";
 import Chats from "./pages/Chats";
 import Cases from "./pages/Cases";
@@ -33,6 +40,22 @@ import Memory from "./pages/Memory";
 
 function Layout() {
   const location = useLocation();
+  const [llmSettings, setLlmSettings] = useState({ provider: "", model: "" });
+
+  useEffect(() => {
+    api.get("/settings/llm")
+      .then((data) => setLlmSettings(data))
+      .catch(() => {});
+  }, []);
+
+  // Re-fetch when navigating to settings
+  useEffect(() => {
+    if (location.pathname === "/settings") {
+      api.get("/settings/llm")
+        .then((data) => setLlmSettings(data))
+        .catch(() => {});
+    }
+  }, [location.pathname]);
 
   const pageTitles = {
     "/": "Playground",
@@ -281,10 +304,7 @@ function Layout() {
 
             {/* Runtime Content */}
 
-            <div className="flex-1 overflow-y-auto p-4">
-
-
-              {/* LLM */}
+            <div className="flex-1 overflow-y-auto p-4">              {/* LLM */}
 
               <div className="mb-6">
 
@@ -300,11 +320,15 @@ function Layout() {
                 <div className="rounded-lg border border-zinc-800 bg-[#1a1a1a] p-3">
 
                   <p className="text-sm font-medium">
+
                     Provider
+
                   </p>
 
                   <p className="mt-1 text-xs text-zinc-500">
-                    Gemini
+
+                    {llmSettings.provider || "—"}
+
                   </p>
 
                 </div>
@@ -313,11 +337,15 @@ function Layout() {
                 <div className="mt-2 rounded-lg border border-zinc-800 bg-[#1a1a1a] p-3">
 
                   <p className="text-sm font-medium">
+
                     Model
+
                   </p>
 
                   <p className="mt-1 text-xs text-zinc-500">
-                    Gemini 3.6 Flash
+
+                    {llmSettings.model || "—"}
+
                   </p>
 
                 </div>

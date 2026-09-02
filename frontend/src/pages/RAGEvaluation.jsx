@@ -20,7 +20,9 @@ import {
   Award,
   TrendingUp,
 } from "lucide-react";
-import { API_URL } from "../config";
+import { casesApi } from "../api/cases";
+import { evalApi } from "../api/eval";
+import { ApiError } from "../api/client";
 
 function RAGEvaluation() {
   const [caseId, setCaseId] = useState("1");
@@ -54,11 +56,8 @@ function RAGEvaluation() {
 
   const loadCases = async () => {
     try {
-      const response = await fetch(API_URL + "/cases");
-      if (response.ok) {
-        const data = await response.json();
-        setCases(data);
-      }
+      const data = await casesApi.list();
+      setCases(data);
     } catch (err) {
       console.error("Failed to load cases:", err);
     }
@@ -66,11 +65,8 @@ function RAGEvaluation() {
 
   const loadEvalQueries = async () => {
     try {
-      const response = await fetch(API_URL + "/cases/" + caseId + "/eval-queries");
-      if (response.ok) {
-        const data = await response.json();
-        setEvalQueries(data);
-      }
+      const data = await evalApi.listQueries(caseId);
+      setEvalQueries(data);
     } catch (err) {
       console.error("Failed to load eval queries:", err);
     }
@@ -80,16 +76,14 @@ function RAGEvaluation() {
     setEvalLoading(true);
     setError("");
     try {
-      const response = await fetch(API_URL + "/cases/" + caseId + "/eval-queries/seed", {
-        method: "POST",
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Failed to seed queries");
-      }
+      await evalApi.seedQueries(caseId);
       await loadEvalQueries();
     } catch (err) {
-      setError(err.message);
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message);
+      }
     } finally {
       setEvalLoading(false);
     }
@@ -100,25 +94,21 @@ function RAGEvaluation() {
     setEvalLoading(true);
     setError("");
     try {
-      const response = await fetch(API_URL + "/cases/" + caseId + "/eval-queries", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: newQuery,
-          description: newDesc || null,
-          expected_document_ids: [parseInt(newExpectedDoc)],
-        }),
+      await evalApi.createQuery(caseId, {
+        query: newQuery,
+        description: newDesc || null,
+        expected_document_ids: [parseInt(newExpectedDoc)],
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Failed to add query");
-      }
       setNewQuery("");
       setNewDesc("");
       setNewExpectedDoc("");
       await loadEvalQueries();
     } catch (err) {
-      setError(err.message);
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message);
+      }
     } finally {
       setEvalLoading(false);
     }
@@ -126,12 +116,8 @@ function RAGEvaluation() {
 
   const deleteEvalQuery = async (queryId) => {
     try {
-      const response = await fetch(API_URL + "/eval-queries/" + queryId, {
-        method: "DELETE",
-      });
-      if (response.ok) {
-        await loadEvalQueries();
-      }
+      await evalApi.deleteQuery(queryId);
+      await loadEvalQueries();
     } catch (err) {
       console.error("Failed to delete query:", err);
     }
@@ -142,17 +128,15 @@ function RAGEvaluation() {
     setError("");
     setEvalResults(null);
     try {
-      const response = await fetch(API_URL + "/cases/" + caseId + "/evaluation/run?top_k=" + topK, {
-        method: "POST",
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Failed to run evaluation");
-      }
+      const data = await evalApi.runEvaluation(caseId, topK);
       setEvalResults(data);
       await loadEvalQueries();
     } catch (err) {
-      setError(err.message);
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message);
+      }
     } finally {
       setEvalLoading(false);
     }
@@ -166,20 +150,14 @@ function RAGEvaluation() {
     setExpandedChunks({});
     setShowContext(false);
     try {
-      const params = new URLSearchParams({
-        query: query.trim(),
-        top_k: String(topK),
-      });
-      const response = await fetch(
-        API_URL + "/cases/" + caseId + "/search/debug?" + params.toString()
-      );
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Evaluation failed");
-      }
+      const data = await evalApi.debugSearch(caseId, query.trim(), topK);
       setResults(data);
     } catch (err) {
-      setError(err.message || "Failed to evaluate retrieval");
+      if (err instanceof ApiError) {
+        setError(err.getUserMessage());
+      } else {
+        setError(err.message || "Failed to evaluate retrieval");
+      }
     } finally {
       setLoading(false);
     }
