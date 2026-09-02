@@ -1,6 +1,9 @@
+import logging
 import os
 import shutil
 from .chat import generate_rag_answer, generate_normal_answer
+
+logger = logging.getLogger(__name__)
 from .llm.exceptions import (
     LLMAuthenticationError,
     LLMConfigurationError,
@@ -1582,19 +1585,47 @@ def send_chat_message(
     # Generate answer based on chat mode
     # --------------------------------------------------------
 
+    # --------------------------------------------------------
+    # Log routing info
+    # --------------------------------------------------------
+
+    logger.info(
+        "[Chat] chat_id=%s mode=%s case_id=%s query=%s",
+        chat_id,
+        session.chat_mode,
+        session.case_id,
+        message_data.content[:80],
+    )
+
+    # --------------------------------------------------------
+    # Generate answer based on chat mode
+    # --------------------------------------------------------
+
     try:
         if session.chat_mode == "normal":
+            logger.info("[Chat] Routing to generate_normal_answer")
             rag_result = generate_normal_answer(
                 query=message_data.content,
                 conversation_history=conversation_history,
                 memory_context=memory_context,
             )
-        else:
+        elif session.chat_mode == "document":
+            logger.info("[Chat] Routing to generate_rag_answer")
             rag_result = generate_rag_answer(
                 query=message_data.content,
                 case_id=session.case_id,
                 top_k=top_k,
                 db=db,
+                conversation_history=conversation_history,
+                memory_context=memory_context,
+            )
+        else:
+            logger.warning(
+                "[Chat] Unknown chat_mode '%s', falling back to normal",
+                session.chat_mode,
+            )
+            rag_result = generate_normal_answer(
+                query=message_data.content,
                 conversation_history=conversation_history,
                 memory_context=memory_context,
             )

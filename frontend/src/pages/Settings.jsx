@@ -44,6 +44,8 @@ function Settings() {
       setCurrentProvider(data.provider);
       setCurrentModel(data.model);
       setMessage({ type: "success", text: data.message });
+      // Notify Runtime panel and other listeners that settings changed
+      window.dispatchEvent(new Event("llm-settings-changed"));
     } catch (err) {
       setMessage({ type: "error", text: err.message || "Failed to save settings" });
     } finally {

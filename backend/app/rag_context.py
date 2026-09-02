@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy.orm import Session
 
 from .config import (
@@ -8,6 +10,8 @@ from .config import (
 )
 from .models import Document
 from .vector_store import search_chunks
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -224,6 +228,32 @@ def build_rag_context(
     deduplicated = resolve_filenames(deduplicated, db)
     final_chunks = apply_context_budget(deduplicated)
     context = build_structured_context(final_chunks)
+
+    logger.info(
+        "[RAG] case_id=%s query=%s retrieved=%d filtered=%d dedup=%d final=%d threshold=%.2f",
+        case_id,
+        query[:80],
+        len(retrieved),
+        len(filtered),
+        len(deduplicated),
+        len(final_chunks),
+        RAG_DISTANCE_THRESHOLD,
+    )
+
+    if retrieved and not filtered:
+        distances = [c["distance"] for c in retrieved]
+        logger.warning(
+            "[RAG] All %d chunks filtered out (distances: %s, threshold: %.2f)",
+            len(retrieved),
+            [f"{d:.4f}" for d in distances],
+            RAG_DISTANCE_THRESHOLD,
+        )
+    elif not retrieved:
+        logger.warning(
+            "[RAG] No chunks retrieved from vector store for case_id=%s (top_k=%d)",
+            case_id,
+            top_k,
+        )
 
     context_chars = sum(len(c["text"]) for c in final_chunks)
 

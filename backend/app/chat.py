@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy.orm import Session
 
 from .context_engine import build_context
@@ -5,6 +7,8 @@ from .llm.factory import create_llm
 from .llm.retry import with_retry
 from .llm.types import LLMRequest
 from .memory import build_memory_context
+
+logger = logging.getLogger(__name__)
 
 
 NO_CONTEXT_RESPONSE = (
@@ -310,6 +314,18 @@ def generate_rag_answer(
     # --------------------------------------------------------
 
     if not chunks and not graph_results and not long_term_memory:
+        rag_meta = context_result.get("metadata", {})
+        logger.warning(
+            "[RAG] No context for case_id=%s: "
+            "chunks=%d graph=%d memory=%s "
+            "retrieved=%d after_filter=%d",
+            case_id,
+            len(chunks),
+            len(graph_results),
+            bool(long_term_memory),
+            rag_meta.get("chunks_retrieved", 0),
+            rag_meta.get("chunks_after_filter", 0),
+        )
         return {
             "query": query,
             "case_id": case_id,
@@ -317,11 +333,16 @@ def generate_rag_answer(
             "chunks": [],
             "chunk_count": 0,
             "graph_results": [],
-            "metadata": context_result.get(
-                "metadata",
-                {},
-            ),
+            "metadata": rag_meta,
         }
+
+    logger.info(
+        "[RAG] Context found for case_id=%s: chunks=%d graph=%d memory=%s",
+        case_id,
+        len(chunks),
+        len(graph_results),
+        bool(long_term_memory),
+    )
 
     # --------------------------------------------------------
     # Build system prompt

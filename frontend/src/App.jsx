@@ -42,20 +42,29 @@ function Layout() {
   const location = useLocation();
   const [llmSettings, setLlmSettings] = useState({ provider: "", model: "" });
 
-  useEffect(() => {
+  const loadLlmSettings = () => {
     api.get("/settings/llm")
       .then((data) => setLlmSettings(data))
       .catch(() => {});
+  };
+
+  useEffect(() => {
+    loadLlmSettings();
   }, []);
 
   // Re-fetch when navigating to settings
   useEffect(() => {
     if (location.pathname === "/settings") {
-      api.get("/settings/llm")
-        .then((data) => setLlmSettings(data))
-        .catch(() => {});
+      loadLlmSettings();
     }
   }, [location.pathname]);
+
+  // Listen for LLM settings changes dispatched from Settings page
+  useEffect(() => {
+    const handleSettingsChange = () => loadLlmSettings();
+    window.addEventListener("llm-settings-changed", handleSettingsChange);
+    return () => window.removeEventListener("llm-settings-changed", handleSettingsChange);
+  }, []);
 
   const pageTitles = {
     "/": "Playground",

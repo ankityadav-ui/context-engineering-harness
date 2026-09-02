@@ -13,10 +13,11 @@ import {
   BookOpen,
   MessageCircle,
   X,
+  Cpu,
 } from "lucide-react";
 import { casesApi } from "../api/cases";
 import { chatsApi } from "../api/chats";
-import { ApiError } from "../api/client";
+import { api, ApiError } from "../api/client";
 
 function Chats() {
   const [caseId, setCaseId] = useState("");
@@ -32,6 +33,13 @@ function Chats() {
   const [showModePicker, setShowModePicker] = useState(false);
   const [selectedMode, setSelectedMode] = useState("document");
 
+  // LLM settings for Runtime panel
+  const [llmSettings, setLlmSettings] = useState({ provider: "", model: "" });
+
+  // Derive the active chat mode from the current session
+  const activeSession = sessions.find((s) => s.id === activeSessionId);
+  const activeMode = activeSession?.chat_mode || null;
+
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -40,6 +48,14 @@ function Chats() {
 
   useEffect(() => {
     loadCases();
+    loadLlmSettings();
+  }, []);
+
+  // Listen for LLM settings changes from Settings page
+  useEffect(() => {
+    const handleSettingsChange = () => loadLlmSettings();
+    window.addEventListener("llm-settings-changed", handleSettingsChange);
+    return () => window.removeEventListener("llm-settings-changed", handleSettingsChange);
   }, []);
 
   useEffect(() => {
@@ -62,9 +78,25 @@ function Chats() {
     }
   };
 
+  const loadLlmSettings = async () => {
+    try {
+      const data = await api.get("/settings/llm");
+      setLlmSettings(data);
+    } catch (err) {
+      console.error("Failed to load LLM settings:", err);
+    }
+  };
+
   useEffect(() => {
     if (activeSessionId) {
       loadChatHistory(activeSessionId);
+    }
+  }, [activeSessionId]);
+
+  // Sync selectedMode when switching sessions
+  useEffect(() => {
+    if (activeSession) {
+      setSelectedMode(activeSession.chat_mode || "document");
     }
   }, [activeSessionId]);
 
@@ -141,17 +173,21 @@ function Chats() {
     }
   };
 
-  const sendMessage = async (event, overrideQuery) => {
+  const sendMessage = async (event, overrideQuery, autoMode) => {
     if (event?.preventDefault) event.preventDefault();
     const userMessage = (overrideQuery || query).trim();
     if (!userMessage || loading) return;
+
+    // Use explicit autoMode if provided (e.g. from suggestion buttons),
+    // otherwise fall back to selectedMode.
+    const effectiveMode = autoMode || selectedMode;
 
     let currentSessionId = activeSessionId;
     if (!currentSessionId) {
       try {
         const newSession = await chatsApi.createSession(caseId, {
           title: userMessage.substring(0, 50) + (userMessage.length > 50 ? "..." : ""),
-          chat_mode: selectedMode,
+          chat_mode: effectiveMode,
         });
         setSessions((prev) => [newSession, ...prev]);
         currentSessionId = newSession.id;
@@ -219,7 +255,7 @@ function Chats() {
               <MessageCircle size={18} />
               <div className="mode-option-text">
                 <span className="mode-option-title">Normal Chat</span>
-                <span className="mode-option-desc">Chat directly with Gemini</span>
+                <span className="mode-option-desc">Chat directly with the configured LLM</span>
               </div>
             </button>
             <button className="mode-option" onClick={() => createNewSession("document")}>
@@ -286,26 +322,18 @@ function Chats() {
                 : "Chats"}
             </h1>
             <div className="chat-topbar-meta">
-              {activeSessionId && (
+              {activeSessionId && activeMode && (
                 <>
-                  {(() => {
-                    const activeSession = sessions.find((s) => s.id === activeSessionId);
-                    const mode = activeSession?.chat_mode || "document";
-                    return (
-                      <>
-                        {mode === "document" && (
-                          <span className="chat-topbar-case">
-                            <Database size={12} />
-                            {cases.find((c) => String(c.id) === String(caseId))?.name || "Case " + caseId}
-                          </span>
-                        )}
-                        <span className={`chat-topbar-type${mode === "normal" ? " normal-mode" : ""}`}>
-                          {mode === "normal" ? <MessageCircle size={12} /> : <BookOpen size={12} />}
-                          {mode === "normal" ? "Normal Chat" : "Document Chat"}
-                        </span>
-                      </>
-                    );
-                  })()}
+                  {activeMode === "document" && (
+                    <span className="chat-topbar-case">
+                      <Database size={12} />
+                      {cases.find((c) => String(c.id) === String(caseId))?.name || "Case " + caseId}
+                    </span>
+                  )}
+                  <span className={`chat-topbar-type${activeMode === "normal" ? " normal-mode" : ""}`}>
+                    {activeMode === "normal" ? <MessageCircle size={12} /> : <BookOpen size={12} />}
+                    {activeMode === "normal" ? "Normal Chat" : "Document Chat"}
+                  </span>
                 </>
               )}
             </div>
@@ -319,19 +347,55 @@ function Chats() {
                 <Sparkles size={28} />
               </div>
               <h2>No chat selected</h2>
-              <p className="empty-chat-case">
-                <Database size={13} />
-                Case: {cases.find((c) => String(c.id) === String(caseId))?.name || "Case " + caseId}
-              </p>
-              <p>Start a new chat to begin a conversation.</p>
-              <div className="suggested-questions">
-                <button onClick={() => sendMessage(null, "What topics are covered in Module 1?")}>
-                  What topics are covered in Module 1?
-                </button>
-                <button onClick={() => sendMessage(null, "Summarize the uploaded document.")}>
-                  Summarize the uploaded document.
-                </button>
-              </div>
+              {activeMode ? (
+                <>
+                  <p className="empty-chat-case">
+                    <Database size={13} />
+                    Case: {cases.find((c) => String(c.id) === String(caseId))?.name || "Case " + caseId}
+                  </p>
+                  <p>{activeMode === "normal"
+                    ? "Send a message to start a conversation with the configured LLM."
+                    : "Send a message to search your case documents."}
+                  </p>
+                  <div className="suggested-questions">
+                    {activeMode === "normal" ? (
+                      <>
+                        <button onClick={() => sendMessage(null, "Hello, who are you?")}>
+                          Hello, who are you?
+                        </button>
+                        <button onClick={() => sendMessage(null, "Explain context engineering.")}>
+                          Explain context engineering.
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={() => sendMessage(null, "What topics are covered in Module 1?")}>
+                          What topics are covered in Module 1?
+                        </button>
+                        <button onClick={() => sendMessage(null, "Summarize the uploaded document.")}>
+                          Summarize the uploaded document.
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="empty-chat-case">
+                    <Database size={13} />
+                    Case: {cases.find((c) => String(c.id) === String(caseId))?.name || "Case " + caseId}
+                  </p>
+                  <p>Start a new chat to begin a conversation.</p>
+                  <div className="suggested-questions">
+                    <button onClick={() => sendMessage(null, "Hello, who are you?", "normal")}>
+                      Hello, who are you?
+                    </button>
+                    <button onClick={() => sendMessage(null, "What topics are covered in Module 1?", "document")}>
+                      What topics are covered in Module 1?
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <div className="messages">
@@ -397,10 +461,7 @@ function Chats() {
                     </div>
                     <div className="thinking">
                       <Loader2 size={17} className="spin" />
-                      <span>{(() => {
-                        const activeSession = sessions.find((s) => s.id === activeSessionId);
-                        return activeSession?.chat_mode === "normal" ? "Thinking..." : "Searching documents and thinking...";
-                      })()}</span>
+                      <span>{activeMode === "normal" ? "Thinking..." : "Searching documents and thinking..."}</span>
                     </div>
                   </div>
                 </div>
@@ -418,10 +479,7 @@ function Chats() {
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={(() => {
-                const activeSession = sessions.find((s) => s.id === activeSessionId);
-                return activeSession?.chat_mode === "normal" ? "Ask anything..." : "Ask something about your documents...";
-              })()}
+              placeholder={activeMode === "normal" ? "Ask anything..." : "Ask something about your documents..."}
               disabled={loading}
               rows={1}
             />
