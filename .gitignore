@@ -1,0 +1,28 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Frontend
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Local databases and uploaded documents
+*.db
+backend/storage/documents/
+backend/storage/images/
+
+# Python test caches
+.pytest_cache/
+.coverage
