@@ -1,116 +1,94 @@
 
-from sqlalchemy.orm import Session
+# Import the database model for stored conversation summaries.
+from app.context_engine.models import ConversationSummary
 
-from app.context_engine.models import (
-    ConversationSummary,
-)
+# Import the conversation window service.
 from app.context_engine.conversation_service import (
     get_conversation_message_window,
 )
+
+# Import the query-aware summarization function.
 from app.context_engine.summarizer import (
     generate_query_aware_summary,
 )
 
 
 def get_or_update_summary(
-    db: Session,
-    conversation_id: str,
+    db,
+    conversation_id: int,
     current_query: str,
     n: int = 6,
-) -> dict:
-    """
-    Retrieve a reusable summary or generate and persist
-    a new summary for the older conversation messages.
-    """
+) -> str:
+    """Retrieve or regenerate a summary of older conversation messages."""
 
-    # Reject empty questions.
-    if not current_query.strip():
-        raise ValueError("Current query cannot be empty.")
+    # Validate the current query.
+    if not current_query or not current_query.strip():
+        raise ValueError("The current query cannot be empty.")
 
-    # Split the conversation into older and recent messages.
+    # Retrieve older messages and the most recent N messages.
     window = get_conversation_message_window(
-        db=db,
-        conversation_id=conversation_id,
+        db,
+        conversation_id,
         n=n,
     )
 
-    older_messages = window["older_messages"]
+    # Get older messages that need summarization.
+    older_messages = window.get("older_messages", [])
 
-    # Find the last older message covered by this summary.
-    covered_through_id = (
-        older_messages[-1]["id"]
-        if older_messages
-        else 0
-    )
+    # No older messages means no summary is required.
+    if not older_messages:
+        return ""
 
-    # Find the existing summary for this conversation.
+    # Determine the latest message covered by this summary.
+    covered_through_message_id = older_messages[-1]["id"]
+
+    # Look for an existing summary for this conversation.
     stored_summary = (
         db.query(ConversationSummary)
         .filter(
-            ConversationSummary.conversation_id
-            == conversation_id
+            ConversationSummary.conversation_id == conversation_id
         )
         .first()
     )
 
-    # If no older messages exist, there is nothing to summarize.
-    if not older_messages:
-        return {
-            "conversation_id": conversation_id,
-            "summary": "",
-            "covered_through_message_id": 0,
-            "status": "no_older_messages",
-        }
-
-    # Reuse the summary only when its coverage and query match.
+    # Reuse the saved summary only when its coverage and query match.
     if (
         stored_summary is not None
         and stored_summary.covered_through_message_id
-        == covered_through_id
-        and stored_summary.last_query == current_query
+        == covered_through_message_id
+        and stored_summary.last_query == current_query.strip()
     ):
-        return {
-            "conversation_id": conversation_id,
-            "summary": stored_summary.summary_text,
-            "covered_through_message_id": covered_through_id,
-            "status": "reused",
-        }
+        return stored_summary.summary_text or ""
 
-    # Generate a fresh query-aware summary.
-    # This prioritizes accuracy when the question changes.
+    # Generate a query-aware summary of the older messages.
     summary_text = generate_query_aware_summary(
         older_messages=older_messages,
-        current_query=current_query,
+        current_query=current_query.strip(),
     )
 
-    # Create a summary record if this is the first summary.
+    # Reject an empty summary rather than saving invalid content.
+    if not summary_text or not summary_text.strip():
+        raise ValueError("The summarizer returned an empty summary.")
+
+    # Create a new database record or update the existing one.
     if stored_summary is None:
         stored_summary = ConversationSummary(
             conversation_id=conversation_id,
-            summary_text=summary_text,
-            covered_through_message_id=covered_through_id,
-            last_query=current_query,
+            summary_text=summary_text.strip(),
+            covered_through_message_id=covered_through_message_id,
+            last_query=current_query.strip(),
         )
 
         db.add(stored_summary)
-
     else:
-        # Update the existing summary instead of creating duplicates.
-        stored_summary.summary_text = summary_text
+        stored_summary.summary_text = summary_text.strip()
         stored_summary.covered_through_message_id = (
-            covered_through_id
+            covered_through_message_id
         )
-        stored_summary.last_query = current_query
+        stored_summary.last_query = current_query.strip()
 
-    # Persist the generated or updated summary.
+    # Persist the summary and return its text.
     db.commit()
     db.refresh(stored_summary)
 
-    return {
-        "conversation_id": conversation_id,
-        "summary": stored_summary.summary_text,
-        "covered_through_message_id": (
-            stored_summary.covered_through_message_id
-        ),
-        "status": "created_or_updated",
-    }
+    return stored_summary.summary_text

@@ -1,16 +1,25 @@
 
+# Import the shared database configuration.
 from app.context_engine.database import Base, engine
 
-# Import the models so SQLAlchemy knows which tables exist.
-from app.context_engine.models import Conversation, Message
+# Import every model so SQLAlchemy registers all tables.
+from app.context_engine.models import (
+    Conversation,
+    Message,
+    ConversationSummary,
+    Memory,
+)
 
 
-def initialize_database():
-    # Create any missing tables in the configured database.
+def init_db():
+    """Create all registered database tables."""
+
+    # Create tables that do not already exist.
     Base.metadata.create_all(bind=engine)
 
-    print("Conversation database tables are ready.")
+    print("Database tables initialized successfully.")
 
 
+# Run initialization when this file is executed directly.
 if __name__ == "__main__":
-    initialize_database()
+    init_db()

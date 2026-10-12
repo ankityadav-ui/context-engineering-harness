@@ -3,6 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.context_engine.models import Memory
 
+import re
+from datetime import datetime, timezone
+
 
 # Restrict memory records to the five supported categories.
 VALID_MEMORY_TYPES = {
@@ -131,3 +134,118 @@ def delete_memory(
     db.commit()
 
     return True
+
+
+def retrieve_relevant_memories(
+    db: Session,
+    user_id: str,
+    query: str,
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Retrieve the most relevant long-term memories using
+    keyword overlap, importance, and recency.
+    """
+
+    # Reject invalid input before searching the database.
+    if not user_id.strip():
+        raise ValueError("user_id cannot be empty.")
+
+    if not query.strip():
+        raise ValueError("Query cannot be empty.")
+
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be between 1 and 50.")
+
+    # Ignore common words that provide little retrieval value.
+    stop_words = {
+        "a", "an", "the", "is", "are", "was", "were",
+        "do", "does", "did", "how", "what", "when",
+        "where", "why", "which", "who", "can", "could",
+        "should", "would", "i", "me", "my", "we", "our",
+        "in", "on", "at", "to", "for", "of", "and",
+        "or", "with", "this", "that", "it", "be",
+        "have", "has", "had", "use", "using",
+    }
+
+    # Convert text into lowercase keyword sets.
+    def extract_keywords(text: str) -> set[str]:
+        words = set(re.findall(r"\b[a-zA-Z0-9_+#.-]+\b", text.lower()))
+        return words - stop_words
+
+    # Extract the meaningful terms from the current question.
+    query_keywords = extract_keywords(query)
+
+    # Retrieve only this user's memories.
+    memories = (
+        db.query(Memory)
+        .filter(Memory.user_id == user_id)
+        .all()
+    )
+
+    # Store each memory together with its calculated score.
+    scored_memories = []
+
+    # Calculate the relevance score for each candidate.
+    for memory in memories:
+        memory_keywords = extract_keywords(memory.content)
+
+        # Count the keywords shared with the current question.
+        matched_keywords = query_keywords & memory_keywords
+        keyword_score = len(matched_keywords) * 2
+
+        # Add the memory's manually assigned importance.
+        importance_score = memory.importance
+
+        # Give recently updated memories a small bonus.
+        updated_at = memory.updated_at
+
+        # Normalize naive timestamps if the database returns one.
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(
+                tzinfo=timezone.utc
+            )
+
+        age_days = (
+            datetime.now(timezone.utc) - updated_at
+        ).total_seconds() / 86400
+
+        if age_days <= 7:
+            recency_score = 1.0
+        elif age_days <= 30:
+            recency_score = 0.5
+        else:
+            recency_score = 0.0
+
+        # Combine the three retrieval signals.
+        total_score = (
+            keyword_score
+            + importance_score
+            + recency_score
+        )
+
+        # Preserve the score and matched keywords for debugging.
+        scored_memories.append({
+            "id": memory.id,
+            "user_id": memory.user_id,
+            "memory_type": memory.memory_type,
+            "content": memory.content,
+            "importance": memory.importance,
+            "conversation_id": memory.conversation_id,
+            "score": total_score,
+            "matched_keywords": sorted(matched_keywords),
+            "updated_at": memory.updated_at.isoformat(),
+        })
+
+    # Sort by score first, then importance, then newest update.
+    scored_memories.sort(
+        key=lambda item: (
+            item["score"],
+            item["importance"],
+            item["updated_at"],
+        ),
+        reverse=True,
+    )
+
+    # Return only the requested number of results.
+    return scored_memories[:limit]
