@@ -1,0 +1,75 @@
+
+.masking-panel {
+  width: 100%;
+  max-width: 850px;
+  margin: 24px auto;
+  padding: 24px;
+  box-sizing: border-box;
+  border: 1px solid #d8dce3;
+  border-radius: 12px;
+}
+
+.masking-panel textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 10px 0 16px;
+  padding: 12px;
+  border: 1px solid #b8c0cc;
+  border-radius: 8px;
+  font: inherit;
+  resize: vertical;
+}
+
+.masking-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.masking-actions button {
+  padding: 10px 18px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.masking-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.masking-actions .secondary-button {
+  border: 1px solid #b8c0cc;
+}
+
+.masking-result {
+  margin-top: 24px;
+}
+
+.masking-result pre {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  padding: 14px;
+  border-radius: 8px;
+  background: #f1f3f5;
+}
+
+.masking-error {
+  color: #b42318;
+}
+
+.safety-passed {
+  color: #157347;
+  font-weight: 600;
+}
+
+.safety-failed {
+  color: #b42318;
+  font-weight: 600;
+}
+
+.masking-note {
+  font-size: 13px;
+  color: #666;
+}

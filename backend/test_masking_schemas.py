@@ -1,10 +1,11 @@
 
-# Import the schemas created in this block.
+import pytest
+from pydantic import ValidationError
+
 from app.masking.schemas import SensitiveEntity, MaskingResult
 
 
-def main():
-    # Create an example detected email entity.
+def test_masking_schemas_store_valid_data():
     entity = SensitiveEntity(
         text="rahul@example.com",
         entity_type="EMAIL",
@@ -13,7 +14,6 @@ def main():
         confidence=0.98,
     )
 
-    # Create a masking result using the detected entity.
     result = MaskingResult(
         document_id="test-document-001",
         original_text="Email: rahul@example.com",
@@ -21,14 +21,17 @@ def main():
         entities=[entity],
     )
 
-    # Verify that the values were stored correctly.
     assert result.entities[0].entity_type == "EMAIL"
     assert result.masked_text == "Email: [EMAIL_1]"
     assert result.safety_passed is False
 
-    # Confirm that this block's schema test passed.
-    print("PASS: Masking schemas work correctly.")
 
-
-if __name__ == "__main__":
-    main()
+def test_masking_schema_rejects_invalid_confidence():
+    with pytest.raises(ValidationError):
+        SensitiveEntity(
+            text="rahul@example.com",
+            entity_type="EMAIL",
+            start=7,
+            end=25,
+            confidence=1.5,
+        )

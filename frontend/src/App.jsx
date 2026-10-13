@@ -3,7 +3,7 @@ import { useState } from "react";
 
 // Import the stylesheet for the application.
 import "./App.css";
-
+import MaskingPanel from "./MaskingPanel";
 
 function App() {
   // Store the current chat input.

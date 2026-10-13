@@ -1,4 +1,10 @@
 
+# Import FastAPI's request validation tools.
+from pydantic import BaseModel, Field
+
+# Import the masking and safety pipeline.
+from app.masking.safety_pipeline import mask_and_validate
+
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -308,4 +314,60 @@ def ask_document(request: RAGRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Question answering failed: {error}",
+        ) from error
+
+
+
+# Define the input expected by the masking endpoint.
+class MaskingTextRequest(BaseModel):
+    # Limit input size to avoid excessively large requests.
+    text: str = Field(min_length=1, max_length=50000)
+
+
+# Expose a dedicated endpoint for sensitive text masking.
+@app.post("/masking/text")
+def mask_text_endpoint(request: MaskingTextRequest):
+    # Reject whitespace-only input.
+    if not request.text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    try:
+        # Run detection, masking, and secondary validation.
+        pipeline_output = mask_and_validate(
+            text=request.text,
+            document_id="text-input",
+        )
+
+        # Retrieve the internal result and safety decision.
+        result = pipeline_output["result"]
+        safety = pipeline_output["safety"]
+
+        # Return masked content and metadata only.
+        # Never return the original text or raw entity values.
+        return {
+            "masked_text": result.masked_text,
+            "safety_passed": safety["passed"],
+            "detected_count": len(result.entities),
+            "detected_categories": sorted({
+                entity.entity_type
+                for entity in result.entities
+            }),
+            "safety_reasons": safety["reasons"],
+        }
+
+    except ValueError as error:
+        # Convert invalid input into a client error.
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    except Exception as error:
+        # Fail closed: do not return original text on failure.
+        raise HTTPException(
+            status_code=500,
+            detail="Masking failed. No result was approved.",
         ) from error

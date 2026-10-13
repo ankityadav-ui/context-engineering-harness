@@ -10,11 +10,8 @@ These tests verify:
 """
 
 from pathlib import Path
-
-from app.context_engine.engine import (
-    assemble_context,
-    resolve_image_path,
-)
+from app.context_engine.engine import assemble_context
+from app.rag.embedding_service import resolve_image_path
 from app.llm import generate_multimodal_response
 
 
