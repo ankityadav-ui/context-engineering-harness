@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-import fitz
+# PyMuPDF is imported under its historical name `fitz`, which is the
+# API used throughout this module.
+import pymupdf as fitz
 
 
 def extract_images_from_pdf(

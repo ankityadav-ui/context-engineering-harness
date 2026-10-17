@@ -1,17 +1,15 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from pinecone import Pinecone
 
 
-# Load environment variables from the project's .env file.
-load_dotenv()
+# Load environment variables from the repository-root .env explicitly,
+# so configuration does not depend on the process working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-
-# Read the Pinecone API key.
-PINECONE_API_KEY = os.getenv(
-    "PINECONE_API_KEY"
-)
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 # Read the Pinecone index name.
@@ -25,23 +23,58 @@ PINECONE_INDEX_NAME = os.getenv(
 PINECONE_NAMESPACE = "multimodal-v2"
 
 
-# Stop the application if the API key is missing.
-if not PINECONE_API_KEY:
-    raise RuntimeError(
-        "PINECONE_API_KEY is not configured."
+# Bound how much of the namespace a single document listing reads, so the
+# endpoint stays predictable even on a large index.
+MAX_DOCUMENT_SCAN_VECTORS = 1000
+DOCUMENT_FETCH_BATCH_SIZE = 100
+
+# Bound how many content units one document lookup or delete reads.
+MAX_DOCUMENT_UNITS = 1000
+DOCUMENT_UNIT_PAGE_SIZE = 100
+
+
+# Hold the index connection until it is actually needed.
+# Creating the client at import time would stop unrelated API routes
+# from starting when Pinecone is not configured.
+_index = None
+
+
+def is_configured() -> bool:
+    """Report whether PINECONE_API_KEY is set, without connecting."""
+
+    return bool(os.getenv("PINECONE_API_KEY"))
+
+
+def get_index():
+    """Return the Pinecone index, creating the client on first use."""
+
+    global _index
+
+    if _index is None:
+        api_key = os.getenv("PINECONE_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "PINECONE_API_KEY is not configured. Set it in the "
+                "root .env file to use document retrieval and indexing."
+            )
+
+        _index = Pinecone(api_key=api_key).Index(
+            PINECONE_INDEX_NAME
+        )
+
+    return _index
+
+
+def __getattr__(name):
+    # Preserve the previous module-level name for callers that import
+    # `index` directly, while still connecting lazily.
+    if name == "index":
+        return get_index()
+
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
     )
-
-
-# Create the Pinecone client.
-pinecone_client = Pinecone(
-    api_key=PINECONE_API_KEY
-)
-
-
-# Connect to the existing Pinecone index.
-index = pinecone_client.Index(
-    PINECONE_INDEX_NAME
-)
 
 
 def upsert_content_units(
@@ -93,7 +126,7 @@ def upsert_content_units(
     if not vectors:
         return 0
 
-    index.upsert(
+    get_index().upsert(
         vectors=vectors,
         namespace=PINECONE_NAMESPACE,
     )
@@ -118,7 +151,7 @@ def search_similar_content(
             }
         }
 
-    response = index.query(
+    response = get_index().query(
         vector=query_embedding,
         top_k=top_k,
         include_metadata=True,
@@ -170,3 +203,253 @@ def search_similar_content(
         results.append(result)
 
     return results
+
+
+def _validate_document_id(document_id: str) -> str:
+    """Reject an empty document identifier before querying Pinecone."""
+
+    if not isinstance(document_id, str) or not document_id.strip():
+        raise ValueError("document_id cannot be empty.")
+
+    return document_id.strip()
+
+
+def list_indexed_documents(
+    max_vectors: int = MAX_DOCUMENT_SCAN_VECTORS,
+) -> dict:
+    """
+    Group the indexed vectors by document_id.
+
+    The namespace stores one vector per content unit, so documents are
+    reconstructed from the vector metadata rather than from a separate
+    document table. Only metadata is read; vector values are not used.
+    """
+
+    index = get_index()
+
+    vector_ids = []
+    scan_truncated = False
+
+    for page in index.list(
+        limit=DOCUMENT_FETCH_BATCH_SIZE,
+        namespace=PINECONE_NAMESPACE,
+    ):
+        for item in page.vectors:
+            # A listed entry can carry no id; it cannot be fetched.
+            if item.id is None:
+                continue
+
+            if len(vector_ids) >= max_vectors:
+                scan_truncated = True
+                break
+
+            vector_ids.append(item.id)
+
+        if scan_truncated:
+            break
+
+    documents: dict[str, dict] = {}
+
+    for start in range(0, len(vector_ids), DOCUMENT_FETCH_BATCH_SIZE):
+        batch = vector_ids[
+            start:start + DOCUMENT_FETCH_BATCH_SIZE
+        ]
+
+        response = index.fetch(
+            ids=batch,
+            namespace=PINECONE_NAMESPACE,
+        )
+
+        for vector in response.vectors.values():
+            metadata = vector.metadata or {}
+            document_id = metadata.get("document_id")
+
+            if not document_id:
+                continue
+
+            entry = documents.setdefault(
+                str(document_id),
+                {
+                    "document_id": str(document_id),
+                    "content_units": 0,
+                    "content_types": set(),
+                    "pages": set(),
+                    "sources": set(),
+                },
+            )
+
+            entry["content_units"] += 1
+
+            content_type = metadata.get("content_type")
+
+            if content_type:
+                entry["content_types"].add(str(content_type))
+
+            page_number = metadata.get("page_number")
+
+            if page_number is not None:
+                entry["pages"].add(page_number)
+
+            source = metadata.get("source")
+
+            if source:
+                entry["sources"].add(str(source))
+
+    documents_list = [
+        {
+            "document_id": entry["document_id"],
+            "content_units": entry["content_units"],
+            "content_types": sorted(entry["content_types"]),
+            "pages": sorted(
+                page
+                for page in entry["pages"]
+                if isinstance(page, int)
+            ),
+            "sources": sorted(entry["sources"]),
+        }
+        for entry in documents.values()
+    ]
+
+    documents_list.sort(
+        key=lambda document: document["document_id"]
+    )
+
+    return {
+        "documents": documents_list,
+        "scanned_vectors": len(vector_ids),
+        "scan_truncated": scan_truncated,
+    }
+
+
+def get_document_content_units(
+    document_id: str,
+    max_units: int = MAX_DOCUMENT_UNITS,
+) -> dict:
+    """
+    Describe one document's content units.
+
+    Returns unit metadata only (type, page, source, reference, and the
+    length of the stored text). The stored text itself is deliberately
+    not returned, because indexed content has not been masked.
+    """
+
+    document_id = _validate_document_id(document_id)
+
+    index = get_index()
+
+    filter_expression = {
+        "document_id": {"$eq": document_id}
+    }
+
+    units = []
+    units_truncated = False
+    pagination_token = None
+
+    while True:
+        page = index.fetch_by_metadata(
+            filter=filter_expression,
+            namespace=PINECONE_NAMESPACE,
+            limit=DOCUMENT_UNIT_PAGE_SIZE,
+            pagination_token=pagination_token,
+        )
+
+        for vector in page.vectors.values():
+            metadata = vector.metadata or {}
+            content = metadata.get("content") or ""
+
+            unit = {
+                "unit_id": vector.id,
+                "content_type": metadata.get("content_type"),
+                "page_number": metadata.get("page_number"),
+                "source": metadata.get("source"),
+                "content_length": (
+                    len(content)
+                    if isinstance(content, str)
+                    else 0
+                ),
+            }
+
+            for key in ("table_number", "image_id", "content_ref"):
+                if metadata.get(key) is not None:
+                    unit[key] = metadata[key]
+
+            units.append(unit)
+
+            if len(units) >= max_units:
+                units_truncated = True
+                break
+
+        if units_truncated:
+            break
+
+        pagination = page.pagination
+
+        pagination_token = (
+            pagination.next
+            if pagination is not None
+            else None
+        )
+
+        if not pagination_token:
+            break
+
+    # Present the units in document order.
+    units.sort(
+        key=lambda unit: (
+            unit.get("page_number") is None,
+            unit.get("page_number") or 0,
+            str(unit.get("content_type") or ""),
+        )
+    )
+
+    return {
+        "document_id": document_id,
+        "content_units": len(units),
+        "units": units,
+        "units_truncated": units_truncated,
+    }
+
+
+def delete_document_from_index(document_id: str) -> dict:
+    """
+    Delete every vector stored for one document.
+
+    The document is looked up first so a missing document is reported
+    instead of silently deleting nothing. Pinecone deletes by metadata
+    filter, and a successful call is not proof that anything was removed,
+    so the number of units seen before the delete is reported back.
+    """
+
+    document_id = _validate_document_id(document_id)
+
+    index = get_index()
+
+    filter_expression = {
+        "document_id": {"$eq": document_id}
+    }
+
+    first_page = index.fetch_by_metadata(
+        filter=filter_expression,
+        namespace=PINECONE_NAMESPACE,
+        limit=DOCUMENT_UNIT_PAGE_SIZE,
+    )
+
+    matched_on_first_page = len(first_page.vectors)
+
+    if matched_on_first_page == 0:
+        return {
+            "document_id": document_id,
+            "matched_content_units_on_first_page": 0,
+            "index_delete_requested": False,
+        }
+
+    index.delete(
+        filter=filter_expression,
+        namespace=PINECONE_NAMESPACE,
+    )
+
+    return {
+        "document_id": document_id,
+        "matched_content_units_on_first_page": matched_on_first_page,
+        "index_delete_requested": True,
+    }

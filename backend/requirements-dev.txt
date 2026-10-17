@@ -1,0 +1,9 @@
+# Context Engineering Harness - development and test dependencies
+#
+# Install on top of the runtime requirements:
+#   python -m pip install -r requirements.txt -r requirements-dev.txt
+#
+# Note: the test suite also imports `httpx` for OpenRouter/retry mocking,
+# but httpx is already a runtime dependency in requirements.txt.
+
+pytest==9.1.1

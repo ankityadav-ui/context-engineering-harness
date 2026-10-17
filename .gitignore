@@ -18,10 +18,11 @@ dist/
 .vscode/
 .idea/
 
-# Local databases and uploaded documents
+# Local databases, uploaded documents, and persisted settings
 *.db
 backend/storage/documents/
 backend/storage/images/
+backend/storage/settings/
 
 # Python test caches
 .pytest_cache/

@@ -9,11 +9,21 @@ from app.masking.safety_service import validate_masked_text
 def mask_and_validate(
     text: str,
     document_id: str,
+    registry=None,
 ) -> dict:
+    """Mask one text unit and validate the masked output.
+
+    ``registry`` is an optional shared
+    :class:`~app.masking.masking_engine.PlaceholderRegistry`. Passing one
+    keeps placeholders identical for the same value across every chunk of
+    a document.
+    """
+
     # Run primary detection and masking first.
     result = mask_document_text(
         text=text,
         document_id=document_id,
+        registry=registry,
     )
 
     # Validate only the masked output.

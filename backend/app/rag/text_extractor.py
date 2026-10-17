@@ -1,7 +1,9 @@
 # This file extracts selectable PDF text
 # and identifies pages that need OCR.
 
-import fitz
+# PyMuPDF is imported under its historical name `fitz`, which is the
+# API used throughout this module.
+import pymupdf as fitz
 
 
 def is_meaningful_text(text: str) -> bool:

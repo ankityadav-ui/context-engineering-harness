@@ -11,18 +11,53 @@ from google.genai import types
 # Configuration
 # --------------------------------------------------
 
-load_dotenv()
+# Load the repository-root .env explicitly, so configuration does not
+# depend on the process working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+load_dotenv(PROJECT_ROOT / ".env")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not configured."
+# Hold the Gemini client until it is actually needed.
+# Building it at import time would stop unrelated API routes from
+# starting when Gemini is not configured.
+_client = None
+
+
+def is_configured() -> bool:
+    """Report whether GEMINI_API_KEY is set, without connecting."""
+
+    return bool(os.getenv("GEMINI_API_KEY"))
+
+
+def get_client():
+    """Return the Gemini client, creating it on first use."""
+
+    global _client
+
+    if _client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not configured. Set it in the "
+                "root .env file to use embedding features."
+            )
+
+        _client = genai.Client(api_key=api_key)
+
+    return _client
+
+
+def __getattr__(name):
+    # Preserve the previous module-level name for callers that import
+    # `client` directly, while still connecting lazily.
+    if name == "client":
+        return get_client()
+
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
     )
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 1024
@@ -44,7 +79,7 @@ def generate_embedding(text: str) -> list[float]:
             "Cannot generate an embedding for empty text."
         )
 
-    response = client.models.embed_content(
+    response = get_client().models.embed_content(
         model=EMBEDDING_MODEL,
         contents=text,
         config=types.EmbedContentConfig(
@@ -158,16 +193,19 @@ def embed_content_units(
 # Resolve extracted image paths
 # --------------------------------------------------
 
+
 def resolve_image_path(
     content_unit: dict,
 ) -> str | None:
     """
-    Resolve an image content_ref such as
-    storage/images/<document_id>/page_5_img_1.png
-    to an existing local file.
+    Resolve stored image references to existing files.
 
-    Returns None if the reference is missing, invalid,
-    or points outside the backend directory.
+    Supports references such as:
+    - images/<document_id>/page_1_img_1.png
+    - storage/images/<document_id>/page_1_img_1.png
+
+    Returns None for invalid references, missing files,
+    or paths that escape the backend directory.
     """
     if content_unit.get("content_type") != "image":
         return None
@@ -177,19 +215,27 @@ def resolve_image_path(
     if not isinstance(content_ref, str) or not content_ref.strip():
         return None
 
-    # Reject absolute paths and Windows drive paths.
+    # Treat stored references as relative paths.
     reference = Path(content_ref)
 
+    # Reject absolute paths and Windows drive paths.
     if reference.is_absolute() or reference.drive:
         return None
 
-    try:
-        resolved_path = (
-            BACKEND_DIR / reference
-        ).resolve()
+    # Normalize references from the retrieval index.
+    parts = reference.parts
 
-        # Ensure the resolved path stays inside backend/.
-        resolved_path.relative_to(BACKEND_DIR.resolve())
+    if parts and parts[0] == "images":
+        reference = Path("storage", *parts)
+    elif not parts or parts[0] != "storage":
+        return None
+
+    try:
+        backend_root = BACKEND_DIR.resolve()
+        resolved_path = (backend_root / reference).resolve()
+
+        # Prevent directory traversal outside backend/.
+        resolved_path.relative_to(backend_root)
 
     except (ValueError, OSError):
         return None

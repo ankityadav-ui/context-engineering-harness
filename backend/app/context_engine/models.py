@@ -8,14 +8,11 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
 from app.context_engine.database import Base
-
-from sqlalchemy import Boolean
-
-from sqlalchemy import UniqueConstraint
 
 
 class Conversation(Base):

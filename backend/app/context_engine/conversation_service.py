@@ -1,6 +1,7 @@
 
 from uuid import uuid4
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.context_engine.models import Conversation, Message
@@ -29,6 +30,79 @@ def create_conversation(
     db.refresh(conversation)
 
     return conversation
+
+
+def get_conversation(
+    db: Session,
+    conversation_id: str,
+) -> Conversation | None:
+    """Return one conversation or None when it does not exist."""
+
+    if not conversation_id or not conversation_id.strip():
+        raise ValueError("conversation_id cannot be empty.")
+
+    return db.get(Conversation, conversation_id.strip())
+
+
+def list_conversations(
+    db: Session,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """List conversations, newest first, with their message counts."""
+
+    # Validate the requested page before querying the database.
+    if not 1 <= limit <= 200:
+        raise ValueError("limit must be between 1 and 200.")
+
+    if offset < 0:
+        raise ValueError("offset cannot be negative.")
+
+    conversations = (
+        db.query(Conversation)
+        .order_by(
+            Conversation.created_at.desc(),
+            Conversation.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    if not conversations:
+        return []
+
+    # Count messages once for every conversation on this page.
+    conversation_ids = [
+        conversation.id for conversation in conversations
+    ]
+
+    message_counts = dict(
+        db.query(
+            Message.conversation_id,
+            func.count(Message.id),
+        )
+        .filter(Message.conversation_id.in_(conversation_ids))
+        .group_by(Message.conversation_id)
+        .all()
+    )
+
+    return [
+        {
+            "id": conversation.id,
+            "title": conversation.title,
+            "created_at": (
+                conversation.created_at.isoformat()
+                if conversation.created_at
+                else None
+            ),
+            "message_count": message_counts.get(
+                conversation.id,
+                0,
+            ),
+        }
+        for conversation in conversations
+    ]
 
 
 def save_message(

@@ -2,7 +2,9 @@ import io
 import os
 from pathlib import Path
 
-import fitz
+# PyMuPDF is imported under its historical name `fitz`, which is the
+# API used throughout this module.
+import pymupdf as fitz
 import pytesseract
 from PIL import Image
 
@@ -13,6 +15,16 @@ TESSERACT_PATH = os.getenv(
 )
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+
+def is_configured() -> bool:
+    """Report whether the configured Tesseract executable exists.
+
+    Only the presence of the binary is checked here; OCR itself is only
+    attempted for pages that need it during document ingestion.
+    """
+
+    return Path(TESSERACT_PATH).is_file()
 
 
 def extract_text_with_ocr(

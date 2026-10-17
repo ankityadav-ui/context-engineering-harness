@@ -1,11 +1,84 @@
 
+import logging
+
 # Import the existing RAG retrieval function.
 from app.rag.rag_service import retrieve_context
 
 
+logger = logging.getLogger("app.context_engine.engine")
+
+# Bounds that keep one assembled context predictable and affordable for
+# the model, however many sources respond.
+MAX_RAG_RESULTS = 20
+MAX_MEMORIES = 5
+MAX_GRAPH_RELATIONSHIPS = 10
+
+# Retrieved text is truncated per unit and in total before it is sent to
+# the model. Truncation is reported in the formatted context so the model
+# never sees a silently cut-off sentence presented as complete evidence.
+MAX_UNIT_CHARS = 4000
+MAX_CONTEXT_CHARS = 24000
+TRUNCATION_NOTICE = "[context truncated: additional retrieved text omitted]"
+
+
+def _dedupe_rag_results(results: list[dict]) -> list[dict]:
+    """Drop repeated retrieval results, keeping the highest score.
+
+    Overlapping document chunks and repeated table text can be returned
+    as separate near-identical matches; sending the same evidence twice
+    wastes context and can make an answer look better supported than it is.
+    """
+
+    best: dict[tuple, dict] = {}
+
+    for result in results:
+        key = (
+            result.get("document_id"),
+            result.get("content_type"),
+            result.get("page_number"),
+            " ".join(str(result.get("content", "")).split()).casefold(),
+            result.get("content_ref") or "",
+        )
+
+        existing = best.get(key)
+
+        if existing is None:
+            best[key] = result
+            continue
+
+        if (result.get("score") or 0) > (existing.get("score") or 0):
+            best[key] = result
+
+    return list(best.values())
+
+
+def _dedupe_relationships(relationships: list[dict]) -> list[dict]:
+    """Drop duplicated graph relationships, preserving order."""
+
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+
+    for relationship in relationships:
+        key = (
+            relationship.get("matched_entity"),
+            relationship.get("source"),
+            relationship.get("relationship"),
+            relationship.get("target"),
+            relationship.get("direction"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(relationship)
+
+    return unique
+
+
 # Define a helper that retrieves conversation information.
 def _get_conversation_context(
-    conversation_id: int,
+    conversation_id: str,
     query: str,
     recent_message_count: int = 6,
 ) -> dict:
@@ -35,15 +108,17 @@ def _get_conversation_context(
             n=recent_message_count,
         )
 
-        # Return the summary and recent messages together.
+        # Return the summary and recent messages together, with the
+        # real window counts reported by the conversation service
+        # (total_messages / older_count / recent_count).
         return {
             "summary": summary,
             "recent_messages": window.get(
                 "recent_messages", []
             ),
-            "older_message_count": window.get(
-                "older_message_count", 0
-            ),
+            "total_messages": window.get("total_messages", 0),
+            "older_count": window.get("older_count", 0),
+            "recent_count": window.get("recent_count", 0),
         }
 
 
@@ -51,7 +126,7 @@ def _get_conversation_context(
 def _get_memory_context(
     query: str,
     user_id: str,
-    limit: int = 5,
+    limit: int = MAX_MEMORIES,
 ) -> list[dict]:
     # Import the memory service and database session factory.
     from app.context_engine.database import SessionLocal
@@ -107,7 +182,7 @@ def assemble_context(
     query: str,
     top_k: int = 5,
     document_id: str | None = None,
-    conversation_id: int | None = None,
+    conversation_id: str | None = None,
     user_id: str | None = None,
 ) -> dict:
     # Reject a blank question before contacting external services.
@@ -124,12 +199,18 @@ def assemble_context(
         "source_errors": [],
     }
 
-    # Retrieve document evidence from Pinecone.
+    # Retrieve document evidence from Pinecone. top_k is bounded by the
+    # API request models and re-bounded here so an internal caller cannot
+    # request an unbounded context either.
     try:
-        context["rag"] = retrieve_context(
-            query=query.strip(),
-            top_k=top_k,
-            document_id=document_id,
+        bounded_top_k = max(1, min(int(top_k), MAX_RAG_RESULTS))
+
+        context["rag"] = _dedupe_rag_results(
+            retrieve_context(
+                query=query.strip(),
+                top_k=bounded_top_k,
+                document_id=document_id,
+            )
         )
     except Exception as error:
         # Preserve other sources if document retrieval fails.
@@ -169,9 +250,9 @@ def assemble_context(
 
     # Search the knowledge graph for related entities.
     try:
-        context["knowledge_graph"] = _get_graph_context(
-            query.strip()
-        )
+        context["knowledge_graph"] = _dedupe_relationships(
+            _get_graph_context(query.strip())
+        )[:MAX_GRAPH_RELATIONSHIPS]
     except Exception as error:
         # Neo4j may be unavailable or not configured yet.
         context["source_errors"].append({
@@ -179,12 +260,42 @@ def assemble_context(
             "error": str(error),
         })
 
+    # Inspectable assembly summary: counts and sizes only. No query text,
+    # memory content, document text, or entity value is logged.
+    logger.info(
+        "Assembled context: query_chars=%d rag=%d memory=%d graph=%d "
+        "conversation=%s source_errors=%d",
+        len(context["query"]),
+        len(context["rag"]),
+        len(context["memory"]),
+        len(context["knowledge_graph"]),
+        "yes" if context["conversation"] else "no",
+        len(context["source_errors"]),
+    )
+
     # Return the combined result to the calling endpoint.
     return context
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    """Truncate one text block to ``limit`` characters."""
+
+    if text is None:
+        return ""
+
+    text = str(text)
+
+    if len(text) <= limit:
+        return text
+
+    return text[:limit].rstrip() + " ..."
+
+
 # Define a function that turns structured context into readable text.
-def format_context(context: dict) -> str:
+def format_context(
+    context: dict,
+    max_chars: int = MAX_CONTEXT_CHARS,
+) -> str:
     # Store each non-empty section before joining them together.
     sections = []
 
@@ -234,7 +345,10 @@ def format_context(context: dict) -> str:
             memory_type = memory.get(
                 "memory_type", "memory"
             )
-            content = memory.get("content", "")
+            content = _truncate_text(
+                memory.get("content", ""),
+                MAX_UNIT_CHARS,
+            )
             memory_lines.append(
                 f"- [{memory_type}] {content}"
             )
@@ -254,7 +368,10 @@ def format_context(context: dict) -> str:
             content_type = result.get(
                 "content_type", "text"
             )
-            content = result.get("content", "")
+            content = _truncate_text(
+                result.get("content", ""),
+                MAX_UNIT_CHARS,
+            )
             page_number = result.get("page_number")
             document_id = result.get("document_id")
 
@@ -310,4 +427,22 @@ def format_context(context: dict) -> str:
         )
 
     # Join all available sources into one context string.
-    return "\n\n".join(sections)
+    formatted = "\n\n".join(sections)
+
+    # Hard ceiling on the context sent to the model. The notice makes the
+    # truncation visible instead of presenting a cut-off transcript as
+    # complete evidence. A non-positive limit disables truncation.
+    if max_chars and max_chars > 0 and len(formatted) > max_chars:
+        logger.info(
+            "Context truncated: %d chars -> %d chars",
+            len(formatted),
+            max_chars,
+        )
+
+        formatted = (
+            formatted[:max_chars].rstrip()
+            + "\n\n"
+            + TRUNCATION_NOTICE
+        )
+
+    return formatted

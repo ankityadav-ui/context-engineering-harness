@@ -15,11 +15,17 @@ from app.context_engine.summarizer import (
 
 def get_or_update_summary(
     db,
-    conversation_id: int,
+    conversation_id: str,
     current_query: str,
     n: int = 6,
 ) -> str:
-    """Retrieve or regenerate a summary of older conversation messages."""
+    """Retrieve or regenerate a summary of older conversation messages.
+
+    Returns the summary text as a plain string. This matches how the
+    Context Engine consumes the value in
+    ``app.context_engine.engine._get_conversation_context`` (stored under
+    the "summary" key and rendered by ``format_context``).
+    """
 
     # Validate the current query.
     if not current_query or not current_query.strip():

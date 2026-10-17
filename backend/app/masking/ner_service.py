@@ -1,13 +1,37 @@
 
-# Import spaCy for natural language processing.
-import spacy
-
 # Import the shared entity schema.
 from app.masking.schemas import SensitiveEntity
 
 
-# Load the English model once when this module is imported.
-nlp = spacy.load("en_core_web_sm")
+# Hold the loaded spaCy model until NER is actually needed.
+# Loading it at import time would stop unrelated API routes from
+# starting when the model or the spaCy package is unavailable.
+_nlp = None
+
+
+def get_nlp():
+    """Return the English spaCy model, loading it on first use."""
+
+    global _nlp
+
+    if _nlp is None:
+        try:
+            import spacy
+        except ImportError as error:
+            raise RuntimeError(
+                "spaCy is not installed. Install it with "
+                "'python -m pip install -r requirements.txt'."
+            ) from error
+
+        try:
+            _nlp = spacy.load("en_core_web_sm")
+        except OSError as error:
+            raise RuntimeError(
+                "The spaCy model 'en_core_web_sm' is not installed. "
+                "Install it with: python -m spacy download en_core_web_sm"
+            ) from error
+
+    return _nlp
 
 
 def detect_entities(text: str) -> list[SensitiveEntity]:
@@ -16,7 +40,7 @@ def detect_entities(text: str) -> list[SensitiveEntity]:
         return []
 
     # Analyze the document and identify named entities.
-    doc = nlp(text)
+    doc = get_nlp()(text)
 
     # Store the detected entities in our common schema.
     entities = []
