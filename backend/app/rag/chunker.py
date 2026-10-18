@@ -1,5 +1,40 @@
-# Import uuid4 so every content unit receives a unique identifier.
-from uuid import uuid4
+# Import uuid4 so every content unit receives a unique identifier,
+# and uuid5 for deterministic, content-derived unit ids.
+import hashlib
+from uuid import NAMESPACE_URL, uuid4, uuid5
+
+# Fixed namespace (derived once from a stable name) for deterministic
+# content-unit ids. The same (document, type, page, content) always
+# maps to the same unit id across processes, so re-ingesting a
+# document overwrites its vectors in Pinecone instead of duplicating
+# them.
+UNIT_ID_NAMESPACE = uuid5(
+    NAMESPACE_URL,
+    "https://github.com/ankityadav-ui/context-engineering-harness/"
+    "ceh-content-unit-id-v1",
+)
+
+
+def _content_fingerprint(content: str) -> str:
+    """Stable fingerprint of one unit's searchable content."""
+
+    normalized = " ".join(str(content or "").split()).casefold()
+
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _deterministic_unit_id(
+    document_id: str,
+    content_type: str,
+    page_number,
+    identity: str,
+) -> str:
+    return str(
+        uuid5(
+            UNIT_ID_NAMESPACE,
+            f"{document_id}|{content_type}|{page_number}|{identity}",
+        )
+    )
 
 
 def _dedupe_key(content_unit: dict) -> tuple:
@@ -66,9 +101,12 @@ def create_content_unit(
     content: str = "",
     content_ref: str | None = None,
     metadata: dict | None = None,
+    unit_id: str | None = None,
 ) -> dict:
-    # Generate a unique identifier for this content unit.
-    unit_id = str(uuid4())
+    # Use the caller-provided id (deterministic) or generate a random
+    # unique identifier.
+    if unit_id is None:
+        unit_id = str(uuid4())
 
     # Create the common structure used by all content types.
     return {
@@ -101,6 +139,12 @@ def build_content_units(
             metadata={
                 "source": text_unit.get("source", "unknown"),
             },
+            unit_id=_deterministic_unit_id(
+                text_unit["document_id"],
+                "text",
+                text_unit["page_number"],
+                _content_fingerprint(text_unit["content"]),
+            ),
         )
 
         # Add the text unit to the common collection.
@@ -119,6 +163,12 @@ def build_content_units(
                 "headers": table_unit.get("headers", []),
                 "rows": table_unit.get("rows", []),
             },
+            unit_id=_deterministic_unit_id(
+                table_unit["document_id"],
+                "table",
+                table_unit["page_number"],
+                _content_fingerprint(table_unit["content"]),
+            ),
         )
 
         # Add the table unit to the common collection.
@@ -136,7 +186,19 @@ def build_content_units(
                 "source": image_unit.get("source", "unknown"),
                 "image_id": image_unit.get("image_id"),
                 "image_format": image_unit.get("image_format"),
+                "caption": image_unit.get("caption", ""),
+                "image_sha256": image_unit.get("image_sha256"),
             },
+            unit_id=_deterministic_unit_id(
+                image_unit["document_id"],
+                "image",
+                image_unit["page_number"],
+                str(
+                    image_unit.get("content_ref")
+                    or image_unit.get("image_id")
+                    or ""
+                ),
+            ),
         )
 
         # Add the image unit to the common collection.

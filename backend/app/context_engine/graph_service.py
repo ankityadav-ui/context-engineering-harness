@@ -10,6 +10,7 @@ from neo4j import GraphDatabase, TrustCustomCAs
 # improving graph precision can never reduce masking coverage.
 from app.context_engine.entity_validation import (
     ENTITY_LABELS as _ENTITY_LABELS,
+    entity_comparison_key,
     entity_name_key,
     is_plausible_entity,
     is_usable_entity_name,
@@ -315,13 +316,17 @@ def _is_usable_entity_name(name: str) -> bool:
 
 
 def _entity_node_id(entity_type: str, entity_name: str) -> str:
-    """Build the deterministic, stable entity id used by MERGE."""
+    """Build the deterministic, stable entity id used by MERGE.
 
-    normalized = " ".join(entity_name.split()).strip().lower()
+    Built from the shared comparison key, so "Dr. Smith" and
+    "dr smith" resolve to the same node instead of two near-duplicates.
+    """
+
+    normalized = entity_comparison_key(entity_name)
 
     slug = "".join(
         character
-        if character.isalnum() or character in " -_"
+        if character.isalnum() or character in " -"
         else "_"
         for character in normalized
     ).strip("_")[:120]

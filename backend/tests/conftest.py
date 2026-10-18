@@ -10,12 +10,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.context_engine import database
 from app.context_engine.database import Base
 
 # Import the models so every table is registered on Base.metadata.
 import app.context_engine.models  # noqa: F401
 
-from app.main import app, get_db
+from app.main import app, get_db, get_db_optional
 
 
 @pytest.fixture()
@@ -56,9 +57,42 @@ def api_client(sqlite_session_factory):
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    # The chat routes persist only when a conversation_id is supplied;
+    # both dependencies must share the same in-memory database.
+    app.dependency_overrides[get_db_optional] = override_get_db
 
     try:
         with TestClient(app) as client:
             yield client
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def isolated_assembly(monkeypatch, sqlite_session_factory):
+    """Keep assemble_context off live services, still exercising the
+    real conversation/summary code paths against SQLite."""
+
+    monkeypatch.setattr(
+        database,
+        "SessionLocal",
+        sqlite_session_factory,
+    )
+
+    # Pinecone, Neo4j, and memory lookups stay off live services; the
+    # conversation/summary branches keep running for real.
+    import app.context_engine.engine as engine
+
+    monkeypatch.setattr(engine, "retrieve_context", lambda **_k: [])
+    monkeypatch.setattr(engine, "_get_graph_context", lambda _q: [])
+
+    # The summarizer calls the LLM; keep it deterministic.
+    import app.context_engine.summarizer as summarizer
+
+    monkeypatch.setattr(
+        summarizer,
+        "generate_response",
+        lambda *_args, **_kwargs: "Older messages summarized.",
+    )
+
+    return monkeypatch

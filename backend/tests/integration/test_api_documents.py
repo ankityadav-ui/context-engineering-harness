@@ -295,6 +295,7 @@ def test_document_routes_reject_unsafe_ids(fake_index):
 
 
 def test_documents_report_missing_pinecone_configuration(monkeypatch):
+    monkeypatch.setattr(pinecone_service, "_client", None)
     monkeypatch.setattr(pinecone_service, "_index", None)
     monkeypatch.delenv("PINECONE_API_KEY", raising=False)
 

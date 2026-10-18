@@ -10,13 +10,15 @@ def mask_and_validate(
     text: str,
     document_id: str,
     registry=None,
+    include_header_name: bool = False,
 ) -> dict:
     """Mask one text unit and validate the masked output.
 
     ``registry`` is an optional shared
     :class:`~app.masking.masking_engine.PlaceholderRegistry`. Passing one
     keeps placeholders identical for the same value across every chunk of
-    a document.
+    a document. ``include_header_name`` enables the document-header name
+    rule for the first text unit only.
     """
 
     # Run primary detection and masking first.
@@ -24,6 +26,7 @@ def mask_and_validate(
         text=text,
         document_id=document_id,
         registry=registry,
+        include_header_name=include_header_name,
     )
 
     # Validate only the masked output.

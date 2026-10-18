@@ -84,20 +84,24 @@ not migrate existing table definitions.
 
 ### Prompts, masking, and safety
 
-The custom prompt is persisted server-side in
-`backend/storage/settings/system_prompt.json` (or at `CEH_SETTINGS_FILE` when
-that override is set). Saving an empty prompt clears the custom value. The
-built-in security instructions and an optional trusted skill file
-(`backend/app/prompts/skills/*.md`) are composed with the custom prompt and
-sent to Ollama as a real `system` message, so user content and retrieved
-documents never travel in the system role and cannot override the
-instructions.
+Every conversation carries its own custom system prompt, persisted
+per conversation in PostgreSQL (`conversations.system_prompt`). The
+prompt editor loads and saves the selected conversation's prompt, and
+resetting it deletes only that conversation's prompt (an empty prompt
+means "use the default system instructions"). The built-in security
+instructions are composed after the conversation's custom prompt and
+sent to Ollama as a real `system` message, so user content and
+retrieved documents never travel in the system role and cannot
+override the instructions.
 
 Masking is explicit and opt-in in two places: a chat message can be masked
 before sending (the message is sent to the model only when masking
 validation passes), and a PDF can be masked after text/OCR extraction but
 before embeddings are generated (in that mode image extraction is skipped
-and the raw PDF is not retained). One shared placeholder registry numbers a
+and the raw PDF is not retained). Chat masking calls `POST /masking/text`
+first and sends only the approved `masked_text`; when the safety check does
+not pass, that endpoint withholds `masked_text` (`null`) and the frontend
+sends nothing. One shared placeholder registry numbers a
 document's chunks together, so the same value keeps the same placeholder in
 every chunk. Masking is a best-effort safeguard: it cannot sanitize chat
 history, memories, graph properties, previously indexed vectors, or image
@@ -140,13 +144,13 @@ pixels, and it cannot guarantee that every sensitive span is detected.
 | `DELETE /documents/{id}` | Delete a document's vectors and local files |
 | `POST /documents/search` | Semantic search over indexed content |
 | `POST /documents/ask` | Context-assembled question answering with sources |
-| `POST /context/preview` | Read-only view of the assembled context for a question |
+| `POST /context/preview` | Read-only view of the assembled context for a question; a supplied conversation uses the same session-ownership rules as chat |
 | `POST /masking/text` | Mask text and return the safety-validation result |
 | `GET/POST /conversations`, `GET /conversations/{id}/messages` | Conversation storage |
 | `GET/POST /memory`, `DELETE /memory/{id}` | Long-term memory storage |
 | `GET /knowledge-graph/entities`, `GET /knowledge-graph/entities/{id}/relationships` | Graph lookups |
 | `GET /knowledge-graph/documents`, `GET /knowledge-graph/documents/{id}/entities` | Ingested documents and their entities |
-| `GET/PUT /settings/system-prompt`, `GET /settings/skills`, `POST /settings/skills/select` | Persisted prompt and skill selection |
+| `GET/PUT/DELETE /conversations/{id}/system-prompt` | Per-conversation custom system prompt (reset via DELETE) |
 
 ## Services and environment
 
@@ -166,7 +170,6 @@ configured.
 | Scanned-PDF OCR | Tesseract executable; `TESSERACT_PATH` if not at its default Windows path |
 | Text masking | spaCy plus the separately installed `en_core_web_sm` model |
 | Log verbosity | `CEH_LOG_LEVEL` (default `INFO`) |
-| Prompt/settings storage override | `CEH_SETTINGS_FILE` |
 
 ## Windows setup and run
 
@@ -211,7 +214,7 @@ backend/
     context_engine/    conversations, memory, summaries, graph, assembly
     masking/           NER, rules, entity resolution, safety validation
     rag/               extraction, OCR, tables, images, embeddings, Pinecone
-    prompts/           default system prompt and trusted skill files
+    prompts/           default system prompt asset
     llm.py, main.py, system_prompt.py
   tests/
     unit/              pure functions and mocked provider behavior
@@ -244,9 +247,11 @@ are never collected by pytest.
 
 ## Known limitations
 
-- `POST /chat` and `POST /chat/stream` do not persist messages or accept a
-  conversation ID, so conversation-aware context is available through
-  `/documents/ask` and `/context/preview` when an ID is supplied.
+- `POST /documents/ask` and `/context/preview` do not persist new
+  messages; `/chat` and `/chat/stream` persist both turns. All four
+  accept a conversation ID, and the conversational paths (`/chat`,
+  `/chat/stream`, `/documents/ask`, `/context/preview`) enforce the same
+  session-ownership rules for it.
 - Image vectors use textual descriptions, not visual embeddings.
 - Masking is optional, cannot sanitize data that is already stored or
   indexed, and cannot guarantee detection of every sensitive span.

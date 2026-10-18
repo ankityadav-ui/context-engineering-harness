@@ -3,6 +3,8 @@ import logging
 
 # Import the existing RAG retrieval function.
 from app.rag.rag_service import retrieve_context
+from app.rag.pinecone_service import search_similar_content
+from app.rag.embedding_service import generate_text_embedding
 
 
 logger = logging.getLogger("app.context_engine.engine")
@@ -219,6 +221,70 @@ def assemble_context(
             "error": str(error),
         })
 
+    # Short resumes and image-based PDFs are indexed by full extracted
+    # text rather than vectors. When retrieval found nothing for the
+    # requested document, build that full-text block ourselves.
+    if document_id is not None and not context["rag"]:
+        try:
+            from app.rag.document_service import (
+                build_full_text,
+                read_masked_text_artifact,
+                resolve_stored_document_path,
+                run_pdf_text_pipeline,
+            )
+            from app.rag.text_extractor import is_pdf_openable
+
+            full_text = ""
+            source = "full_text"
+
+            # A masked upload deliberately keeps no raw PDF. Its
+            # safety-validated text is the only fallback, so raw PII is
+            # never re-extracted and sent to the model.
+            masked_text = read_masked_text_artifact(document_id)
+
+            if masked_text:
+                full_text = masked_text
+                source = "masked_full_text"
+            else:
+                stored_path = resolve_stored_document_path(document_id)
+
+                if stored_path.is_file() and is_pdf_openable(stored_path):
+                    # run_pdf_text_pipeline applies the same OCR fallback
+                    # used at upload time, so a scanned resume is also
+                    # summarizable when the vector index returns nothing.
+                    text_units, _pages, _ = run_pdf_text_pipeline(
+                        document_path=stored_path,
+                        document_id=document_id,
+                    )
+
+                    full_text = build_full_text(
+                        [
+                            {**unit, "content_type": "text"}
+                            for unit in text_units
+                        ]
+                    )
+
+            if full_text.strip():
+                context["rag"] = _dedupe_rag_results(
+                    [
+                        {
+                            "content_type": "text",
+                            "content": full_text,
+                            "document_id": document_id,
+                            "page_number": 1,
+                            "source": source,
+                        }
+                    ]
+                )
+        except Exception as error:
+            # A full-text fallback failure is a source error, not a
+            # hard failure: the conversation, memory and graph sources
+            # still contribute to the answer.
+            context["source_errors"].append({
+                "source": "full_text",
+                "error": str(error),
+            })
+
     # Retrieve conversation summary and recent messages when
     # a specific conversation has been supplied.
     if conversation_id is not None:
@@ -358,6 +424,29 @@ def format_context(
             + "\n".join(memory_lines)
         )
 
+
+    # Add relationships retrieved from the knowledge graph.
+    graph_results = context.get("knowledge_graph", [])
+    if graph_results:
+        graph_lines = []
+
+        for relationship in graph_results:
+            # Format each relationship as source → relation → target.
+            source = relationship.get("source", "Unknown")
+            relation = relationship.get(
+                "relationship", "RELATED_TO"
+            )
+            target = relationship.get("target", "Unknown")
+
+            graph_lines.append(
+                f"{source} --{relation}--> {target}"
+            )
+
+        sections.append(
+            "KNOWLEDGE GRAPH RELATIONSHIPS:\n"
+            + "\n".join(graph_lines)
+        )
+
     # Add retrieved document, table, and image-reference results.
     rag_results = context.get("rag", [])
     if rag_results:
@@ -402,28 +491,6 @@ def format_context(
         sections.append(
             "RELEVANT DOCUMENT EVIDENCE:\n"
             + "\n\n".join(rag_lines)
-        )
-
-    # Add relationships retrieved from the knowledge graph.
-    graph_results = context.get("knowledge_graph", [])
-    if graph_results:
-        graph_lines = []
-
-        for relationship in graph_results:
-            # Format each relationship as source → relation → target.
-            source = relationship.get("source", "Unknown")
-            relation = relationship.get(
-                "relationship", "RELATED_TO"
-            )
-            target = relationship.get("target", "Unknown")
-
-            graph_lines.append(
-                f"{source} --{relation}--> {target}"
-            )
-
-        sections.append(
-            "KNOWLEDGE GRAPH RELATIONSHIPS:\n"
-            + "\n".join(graph_lines)
         )
 
     # Join all available sources into one context string.

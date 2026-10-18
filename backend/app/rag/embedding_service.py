@@ -5,6 +5,20 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from PIL import Image
+
+# Formats the vision path supports. Kept in sync with
+# app.rag.image_extractor.SUPPORTED_IMAGE_EXTENSIONS.
+SUPPORTED_IMAGE_SUFFIXES = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 
 
 # --------------------------------------------------
@@ -61,6 +75,9 @@ def __getattr__(name):
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 1024
+
+# How much of the surrounding page context is embedded with an image.
+MAX_IMAGE_CONTEXT_CHARS = 800
 
 # backend/app/rag/embedding_service.py -> backend/
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -151,10 +168,30 @@ def get_embedding_text(content_unit: dict) -> str:
             "image_id", "unknown-image"
         )
 
-        return (
+        image_format = metadata.get("image_format")
+
+        parts = [
             f"Image {image_id} extracted from "
             f"page {page_number} of the document."
-        )
+        ]
+
+        if image_format:
+            parts.append(f"Format: {image_format}.")
+
+        # The surrounding page text is what makes the image findable
+        # by semantic queries about its content (charts, diagrams,
+        # figures). It stays inside the same 1024-dimension text
+        # embedding space, so the existing Pinecone index and query
+        # path are untouched.
+        caption = str(metadata.get("caption") or "").strip()
+
+        if caption:
+            parts.append(
+                "Surrounding page context: "
+                + caption[:MAX_IMAGE_CONTEXT_CHARS]
+            )
+
+        return "\n".join(parts)
 
     raise ValueError(
         f"Unsupported content type: {content_type}"
@@ -241,6 +278,23 @@ def resolve_image_path(
         return None
 
     if not resolved_path.is_file():
+        return None
+
+    # Only formats the vision path can open are resolvable; a corrupt
+    # or truncated file must not reach the multimodal model.
+    if resolved_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+        return None
+
+    try:
+        if resolved_path.stat().st_size == 0:
+            return None
+
+        # Cheap integrity check: Pillow verifies the file structure
+        # without decoding the full image.
+        with Image.open(resolved_path) as image:
+            image.verify()
+
+    except Exception:
         return None
 
     return str(resolved_path)

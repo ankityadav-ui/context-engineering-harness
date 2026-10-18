@@ -47,6 +47,10 @@ def test_context_preview_reports_sources_without_generating_an_answer(
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("The preview must not generate an answer.")
 
+    # A real conversation in the in-memory database: conversation
+    # previews now apply the same ownership checks as chat.
+    created = api_client.post("/conversations", json={}).json()
+
     monkeypatch.setattr(
         main_module,
         "assemble_context",
@@ -64,7 +68,7 @@ def test_context_preview_reports_sources_without_generating_an_answer(
         json={
             "query": "  What is the policy?  ",
             "top_k": 3,
-            "conversation_id": "9b19f12f-7212-4a7f-bf44-7ec0c23c9542",
+            "conversation_id": created["id"],
             "user_id": "user-1",
         },
     )
@@ -78,7 +82,7 @@ def test_context_preview_reports_sources_without_generating_an_answer(
         "query": "What is the policy?",
         "top_k": 3,
         "document_id": None,
-        "conversation_id": "9b19f12f-7212-4a7f-bf44-7ec0c23c9542",
+        "conversation_id": created["id"],
         "user_id": "user-1",
     }
     assert body["query"] == "What is the policy?"
@@ -131,6 +135,77 @@ def test_context_preview_counts_only_resolvable_image_units(
     assert body["sources"]["rag"][0]["image_id"] == "known.png"
     assert "C:/server" not in str(body)
     assert "storage" not in body["formatted_context"]
+
+
+def test_context_preview_enforces_conversation_session_ownership(
+    api_client,
+    monkeypatch,
+):
+    assembled: list[dict] = []
+
+    def fake_assemble_context(**kwargs):
+        assembled.append(kwargs)
+        return _context()
+
+    monkeypatch.setattr(
+        main_module,
+        "assemble_context",
+        fake_assemble_context,
+    )
+
+    created = api_client.post(
+        "/conversations",
+        json={"title": "Owned", "session_id": "session-a"},
+    ).json()
+
+    payload = {
+        "query": "What is the policy?",
+        "conversation_id": created["id"],
+    }
+
+    # No claim and a different claim both conceal the conversation.
+    for session_id in (None, "session-b"):
+        body = dict(payload)
+
+        if session_id is not None:
+            body["session_id"] = session_id
+
+        denied = api_client.post("/context/preview", json=body)
+
+        assert denied.status_code == 404
+        assert created["id"] in denied.json()["detail"]
+
+    # Assembly never ran for a not-owned conversation.
+    assert assembled == []
+
+    allowed = api_client.post(
+        "/context/preview",
+        json={**payload, "session_id": "session-a"},
+    )
+
+    assert allowed.status_code == 200
+    assert assembled[0]["conversation_id"] == created["id"]
+
+
+def test_context_preview_rejects_unknown_conversation(api_client, monkeypatch):
+    def fail_if_called(**_kwargs):
+        raise AssertionError("Assembly must not run for a 404.")
+
+    monkeypatch.setattr(
+        main_module,
+        "assemble_context",
+        fail_if_called,
+    )
+
+    response = api_client.post(
+        "/context/preview",
+        json={
+            "query": "Anything",
+            "conversation_id": "9b19f12f-7212-4a7f-bf44-7ec0c23c9542",
+        },
+    )
+
+    assert response.status_code == 404
 
 
 def test_context_preview_surfaces_source_errors(

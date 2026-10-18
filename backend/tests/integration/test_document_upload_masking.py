@@ -19,11 +19,11 @@ from app.rag import document_service
 RAW_TEXT = "Contact John Doe at john@example.com for details."
 
 
-def masked_text_stub(text, document_id, registry=None):
+def masked_text_stub(text, document_id, registry=None, **kwargs):
     """Stand-in for mask_and_validate with a predictable replacement.
 
     Accepts the optional shared placeholder registry that the upload
-    pipeline passes to every unit.
+    pipeline passes to every unit, plus the header-name flag.
     """
 
     masked = (
@@ -44,7 +44,7 @@ def masked_text_stub(text, document_id, registry=None):
     }
 
 
-def failing_mask_stub(text, document_id, registry=None):
+def failing_mask_stub(text, document_id, registry=None, **kwargs):
     """Stand-in where the secondary safety validation fails."""
 
     return {
@@ -75,8 +75,18 @@ def pipeline_recorder(monkeypatch, tmp_path):
     }
 
     document_dir = tmp_path / "documents"
+    image_dir = tmp_path / "images"
     document_dir.mkdir()
+    image_dir.mkdir()
     monkeypatch.setattr(main_module, "DOCUMENT_DIR", document_dir)
+    # The masked full-text artifact is written through the document
+    # service, so both storage roots must point at the temporary
+    # directory. Otherwise a test would leave files in the real
+    # backend/storage directory.
+    monkeypatch.setattr(
+        document_service, "DOCUMENT_STORAGE_DIR", document_dir
+    )
+    monkeypatch.setattr(document_service, "IMAGE_STORAGE_DIR", image_dir)
 
     def fake_text_extraction(document_path, document_id):
         return (
@@ -141,7 +151,7 @@ def pipeline_recorder(monkeypatch, tmp_path):
         ]
         return len(embedded_units)
 
-    def fake_mask(text, document_id, registry=None):
+    def fake_mask(text, document_id, registry=None, **kwargs):
         record["mask_calls"].append(text)
         record.setdefault("registries", []).append(registry)
         return masked_text_stub(text, document_id, registry)

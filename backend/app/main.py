@@ -43,7 +43,10 @@ from app.rag.document_service import (
     document_storage_status,
     process_document,
     validate_document_id,
+    write_masked_text_artifact,
 )
+from app.rag.ocr import OCRUnavailableError
+from app.rag.text_extractor import PDFProcessingError
 from app.rag.embedding_service import (
     generate_text_embedding,
     resolve_image_path,
@@ -59,17 +62,26 @@ from app.rag.pinecone_service import (
 # Importing them does not connect to anything: each client is created on
 # first use (see the is_configured() helper in each module).
 from app.context_engine import database as context_database
-from app.context_engine import graph_service
+from app.context_engine import graph_cleanup, graph_service
 from app.rag import embedding_service, ocr, pinecone_service
 from app.context_engine.engine import (
     assemble_context,
     format_context,
 )
 from app.context_engine.conversation_service import (
+    clear_conversation,
+    conversation_accessible,
     create_conversation,
+    delete_conversation,
     get_conversation,
+    get_conversation_system_prompt,
     get_last_n_messages,
+    is_valid_conversation_id,
+    list_conversation_messages,
     list_conversations,
+    reset_conversation_system_prompt,
+    save_conversation_system_prompt,
+    save_message,
 )
 from app.context_engine.graph_service import (
     find_document_entities,
@@ -88,13 +100,6 @@ from app.system_prompt import (
     MAX_CUSTOM_PROMPT_LENGTH,
     SECURITY_INSTRUCTIONS,
     build_instructions,
-    get_active_skill,
-    get_default_prompt_text,
-    get_skill_text,
-    get_system_prompt,
-    list_skills,
-    save_active_skill,
-    save_system_prompt,
 )
 
 
@@ -215,6 +220,26 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
 
+    # Optional durable conversation. When present, both user and
+    # assistant messages are persisted and the prompt is assembled by
+    # the single authoritative context-assembly path (conversation
+    # summary + recent messages + memory + RAG + graph). When absent,
+    # the pre-existing stateless contract is preserved exactly.
+    conversation_id: str | None = Field(default=None, max_length=36)
+
+    # Session-ownership claim (no authentication system exists; this
+    # mirrors the trusted user_id claim used by the memory API).
+    session_id: str | None = Field(default=None, max_length=64)
+
+    # Optional long-term-memory owner for context assembly.
+    user_id: str | None = Field(default=None, max_length=100)
+
+    # Optional scope for the uploaded/selected document. When present,
+    # retrieval is restricted to that document and the Context Engine's
+    # full-text fallback can ground "summarise this" even when vector
+    # search returns nothing.
+    document_id: str | None = Field(default=None, max_length=64)
+
 
 class DocumentSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10000)
@@ -228,6 +253,11 @@ class RAGRequest(BaseModel):
     document_id: str | None = None
     conversation_id: str | None = Field(default=None, max_length=36)
     user_id: str | None = None
+
+    # Session-ownership claim, mirroring ChatRequest: when a
+    # conversation_id is supplied, the same session-ownership rules as
+    # POST /chat apply to it.
+    session_id: str | None = Field(default=None, max_length=64)
 
 
 # --------------------------------------------------
@@ -321,8 +351,104 @@ def read_capabilities():
 # Normal chat
 # --------------------------------------------------
 
+def get_db_optional():
+    """Database session for routes that persist only when asked.
+
+    Yields a session when storage is configured, and None otherwise,
+    so a stateless request (POST /chat without a conversation_id) keeps
+    working without DATABASE_URL. A persistence request without
+    configuration fails at the route with a clear 503 instead of a
+    crash. Delegates to get_db for session handling, so tests that
+    override get_db cover this dependency too (see conftest).
+    """
+
+    if not context_database.is_configured():
+        yield None
+        return
+
+    yield from get_db()
+
+
+def _normalize_conversation_id(
+    conversation_id: str | None,
+) -> str | None:
+    """Trim an optional conversation id; None means stateless chat."""
+
+    if not conversation_id or not conversation_id.strip():
+        return None
+
+    return conversation_id.strip()
+
+
+def _validated_document_id(
+    document_id: str | None,
+) -> str | None:
+    """Trim and validate an optional document scope.
+
+    The id is later used to build storage paths, so an invalid value is
+    rejected with a client error instead of being passed to a query or
+    path helper.
+    """
+
+    if not document_id or not document_id.strip():
+        return None
+
+    try:
+        return validate_document_id(document_id)
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+
+def _load_accessible_conversation(
+    db,
+    conversation_id: str,
+    session_id: str | None,
+):
+    """Return the conversation, or raise a client error.
+
+    Unknown and not-owned conversations both return 404 so one
+    session's conversation id can never be probed by another.
+    """
+
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Conversation persistence requires storage; set "
+                "DATABASE_URL in the root .env file."
+            ),
+        )
+
+    if not is_valid_conversation_id(conversation_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Conversation {conversation_id!r} was not found.",
+        )
+
+    try:
+        conversation = get_conversation(db, conversation_id)
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    if (
+        conversation is None
+        or not conversation_accessible(conversation, session_id)
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Conversation {conversation_id!r} was not found.",
+        )
+
+    return conversation
+
+
 @app.post("/chat")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, db=Depends(get_db_optional)):
     message = request.message.strip()
 
     if not message:
@@ -331,26 +457,166 @@ def chat(request: ChatRequest):
             detail="Message cannot be empty.",
         )
 
-    # Trusted instructions (stored custom prompt, active skill, and the
-    # built-in security rules) travel as a separate system message; the
-    # user's message stays user content.
-    system_text, custom_prompt_applied = build_instructions()
+    conversation_id = _normalize_conversation_id(
+        request.conversation_id
+    )
+
+    # The document scope is what makes "summarise this" resolve to the
+    # resume the user just uploaded. Without it, retrieval searches the
+    # whole index and the full-text fallback can never run.
+    target_document_id = _validated_document_id(request.document_id)
+
+    # Stateless chat: the pre-existing contract, unchanged. A caller
+    # that explicitly scopes a document still gets document evidence.
+    if conversation_id is None and target_document_id is None:
+        system_text, custom_prompt_applied = build_instructions()
+
+        try:
+            answer = generate_response(
+                prompt=message,
+                system=system_text,
+            )
+            return {
+                "response": answer,
+                "system_prompt_active": custom_prompt_applied,
+            }
+
+        except LLMError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=str(error),
+            ) from error
+
+    # Persistent chat: everything is assembled through the single
+    # authoritative context path, which reads the conversation's
+    # persisted history (summary of older messages + latest six).
+    # A document-scoped stateless request still uses that same path,
+    # just without conversation history.
+    conversation = None
+
+    if conversation_id is not None:
+        conversation = _load_accessible_conversation(
+            db,
+            conversation_id,
+            request.session_id,
+        )
+
+    # Trusted instructions (the selected conversation's custom prompt
+    # plus the built-in security rules) travel as a separate system
+    # message; the user's message stays user content.
+    system_text, custom_prompt_applied = build_instructions(
+        custom_prompt=(conversation.system_prompt or "") if conversation else ""
+    )
+
+    try:
+        context = assemble_context(
+            query=message,
+            document_id=target_document_id,
+            conversation_id=(
+                conversation.id if conversation is not None else None
+            ),
+            user_id=request.user_id,
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    # A selected document with no retrievable content (after vector
+    # retrieval and the full-text fallback) cannot support a grounded
+    # answer. Report that instead of inviting a fabricated summary.
+    if target_document_id is not None and not context.get("rag"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The selected document has no retrievable content, so "
+                "it cannot be summarised. Re-upload the PDF or select a "
+                "different document."
+            ),
+        )
+
+    # An empty retrieval result without a document scope is a
+    # legitimate outcome: chat works without uploaded documents.
+    formatted_context = format_context(context)
+
+    # Persist the user turn only after the context was assembled, so
+    # the current message is never duplicated inside its own context.
+    if conversation is not None:
+        _save_chat_message(db, conversation.id, "user", message)
 
     try:
         answer = generate_response(
-            prompt=message,
+            prompt=formatted_context,
             system=system_text,
         )
+
+    except LLMError as error:
+        # Fail-closed persistence: the user turn is stored, but no
+        # assistant answer is saved for a failed generation.
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+
+    if conversation is None:
         return {
             "response": answer,
             "system_prompt_active": custom_prompt_applied,
         }
 
-    except LLMError as error:
+    _save_chat_message(db, conversation.id, "assistant", answer)
+
+    return {
+        "response": answer,
+        "system_prompt_active": custom_prompt_applied,
+        "conversation_id": conversation.id,
+        "conversation_context": _describe_conversation_context(
+            context
+        ),
+    }
+
+
+def _save_chat_message(
+    db,
+    conversation_id: str,
+    role: str,
+    content: str,
+) -> None:
+    """Persist one chat message, converting failures to API errors."""
+
+    try:
+        save_message(
+            db=db,
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+        )
+
+    except ValueError as error:
+        # The conversation disappeared between checks (or content was
+        # empty, which the endpoint already rejected).
         raise HTTPException(
-            status_code=503,
+            status_code=404,
             detail=str(error),
         ) from error
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+
+def _describe_conversation_context(context: dict) -> dict:
+    """Counts-only description of the assembled conversation context."""
+
+    conversation = context.get("conversation") or {}
+
+    return {
+        "total_messages": conversation.get("total_messages", 0),
+        "older_count": conversation.get("older_count", 0),
+        "recent_count": conversation.get("recent_count", 0),
+        "summary_present": bool(conversation.get("summary")),
+    }
 
 
 # --------------------------------------------------
@@ -358,8 +624,9 @@ def chat(request: ChatRequest):
 # --------------------------------------------------
 # A separate endpoint keeps POST /chat's JSON contract untouched. The
 # request body is identical, and the instructions are composed by the
-# same build_instructions path as POST /chat, so streaming never
-# bypasses the system-prompt composition or security instructions.
+# same build_instructions path as POST /chat (including the selected
+# conversation's custom prompt), so streaming never bypasses the
+# system-prompt composition or security instructions.
 #
 # Event protocol (one SSE event per frame):
 #   event: chunk  data: {"delta": "..."}          incremental text
@@ -379,7 +646,10 @@ def _sse_event(event: str, data: dict) -> str:
 
 
 @app.post("/chat/stream")
-def chat_stream(request: ChatRequest):
+def chat_stream(
+    request: ChatRequest,
+    db=Depends(get_db_optional),
+):
     """Stream an assistant reply as server-sent events.
 
     Chunks are emitted as the provider generates them. Provider
@@ -387,6 +657,13 @@ def chat_stream(request: ChatRequest):
     prompt or credentials). When the client disconnects, Starlette
     closes this generator, which closes the provider's upstream
     stream and releases the connection.
+
+    When a conversation_id is supplied, the prompt is assembled by the
+    same authoritative context path as POST /chat, the user turn is
+    persisted before streaming, and the FINAL assistant response is
+    persisted exactly once after the stream completes successfully.
+    No message is stored per SSE chunk, and a failed stream never
+    stores a misleading assistant answer.
     """
 
     message = request.message.strip()
@@ -397,18 +674,82 @@ def chat_stream(request: ChatRequest):
             detail="Message cannot be empty.",
         )
 
-    # Same instruction-composition path as POST /chat: trusted
-    # instructions are sent as the system message, and the user's
-    # message is sent as user content.
-    system_text, custom_prompt_applied = build_instructions()
-
     # Captured at request time so the completion event reports the
     # provider that actually served this stream.
     active = describe_active_provider()
 
+    conversation_id = _normalize_conversation_id(
+        request.conversation_id
+    )
+    target_document_id = _validated_document_id(request.document_id)
+    conversation = None
+    prompt_text = message
+
+    # Same instruction-composition path as POST /chat: trusted
+    # instructions are sent as the system message, and the user's
+    # message is sent as user content. Without a conversation only the
+    # default trusted instructions (built-in security rules) apply.
+    system_text, custom_prompt_applied = build_instructions()
+
+    if conversation_id is not None or target_document_id is not None:
+        if conversation_id is not None:
+            conversation = _load_accessible_conversation(
+                db,
+                conversation_id,
+                request.session_id,
+            )
+
+            # The selected conversation's own custom prompt is composed
+            # with the built-in security rules, exactly like POST /chat.
+            system_text, custom_prompt_applied = build_instructions(
+                custom_prompt=conversation.system_prompt or ""
+            )
+
+        try:
+            context = assemble_context(
+                query=message,
+                document_id=target_document_id,
+                conversation_id=(
+                    conversation.id
+                    if conversation is not None
+                    else None
+                ),
+                user_id=request.user_id,
+            )
+
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail=str(error),
+            ) from error
+
+        # A selected document with no retrievable content cannot
+        # support a grounded answer; report it instead of streaming a
+        # fabricated summary. Without a document scope, empty retrieval
+        # is a legitimate outcome.
+        if target_document_id is not None and not context.get("rag"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "The selected document has no retrievable content, "
+                    "so it cannot be summarised. Re-upload the PDF or "
+                    "select a different document."
+                ),
+            )
+
+        prompt_text = format_context(context)
+
+        # Persist the user turn before streaming. The current message
+        # is excluded from its own context because assembly ran first.
+        if conversation is not None:
+            _save_chat_message(db, conversation.id, "user", message)
+
     def event_stream():
         emitted: list[str] = []
-        deltas = stream_response(prompt=message, system=system_text)
+        deltas = stream_response(
+            prompt=prompt_text,
+            system=system_text,
+        )
 
         try:
             for delta in deltas:
@@ -417,20 +758,55 @@ def chat_stream(request: ChatRequest):
 
             answer = "".join(emitted)
 
-            yield _sse_event(
-                "done",
-                {
-                    "response": answer,
-                    "provider": active["provider"],
-                    "model": active["model"],
-                    "system_prompt_active": custom_prompt_applied,
-                },
-            )
+            # Persist the FINAL response once, after the stream
+            # completed successfully. A persistence failure is
+            # reported as an error event with the generated answer,
+            # instead of a done event that would falsely imply the
+            # conversation stored it.
+            if conversation is not None:
+                try:
+                    save_message(
+                        db=db,
+                        conversation_id=conversation.id,
+                        role="assistant",
+                        content=answer,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Assistant message persistence failed for "
+                        "conversation %s",
+                        conversation.id,
+                    )
+                    yield _sse_event(
+                        "error",
+                        {
+                            "detail": (
+                                "The reply was generated but could "
+                                "not be stored in the conversation."
+                            ),
+                            "partial": answer,
+                        },
+                    )
+                    return
+
+            done_payload = {
+                "response": answer,
+                "provider": active["provider"],
+                "model": active["model"],
+                "system_prompt_active": custom_prompt_applied,
+            }
+
+            if conversation is not None:
+                done_payload["conversation_id"] = conversation.id
+
+            yield _sse_event("done", done_payload)
 
         except LLMError as error:
             # The failure message comes from our own LLM layer: it
             # describes configuration/provider problems without the
-            # prompt or any credentials.
+            # prompt or any credentials. No assistant message is
+            # persisted for a failed generation.
             yield _sse_event(
                 "error",
                 {
@@ -593,6 +969,10 @@ async def upload_document(
         )
 
         if not content_units:
+            # Nothing retrievable was indexed, so do not leave the raw
+            # upload or any extracted images behind.
+            _remove_upload_artifacts(document_id, document_path)
+
             raise HTTPException(
                 status_code=422,
                 detail="No retrievable content was extracted from this PDF.",
@@ -633,7 +1013,29 @@ async def upload_document(
             )
 
         # Masked documents are never kept as raw files on disk: only
-        # the sanitized content units were embedded and indexed.
+        # the sanitized content units were embedded and indexed. The
+        # sanitized full text is retained so `summarise this` can still
+        # use the full-text fallback without the raw PDF.
+        masked_text_stored = False
+
+        if masking_stats["applied"]:
+            try:
+                masked_text_stored = (
+                    write_masked_text_artifact(
+                        document_id,
+                        content_units,
+                    )
+                    is not None
+                )
+            except OSError as error:
+                # Indexing already succeeded; a missing fallback artifact
+                # must not turn a successful upload into an error.
+                logger.warning(
+                    "Could not store masked full text for %s: %s",
+                    document_id,
+                    error,
+                )
+
         if masking_stats["applied"] and document_path.exists():
             document_path.unlink()
 
@@ -653,6 +1055,7 @@ async def upload_document(
             "masking_applied": masking_stats["applied"],
             "masking_safety_passed": masking_stats["safety_passed"],
             "masked_entities": masking_stats["masked_entities"],
+            "masked_text_stored": masked_text_stored,
             "knowledge_graph": {
                 "ingested": graph_result is not None,
                 "entities": (
@@ -672,6 +1075,17 @@ async def upload_document(
     except HTTPException:
         raise
 
+    except PDFProcessingError as error:
+        # Empty, truncated, or unopenable PDFs are client errors. The
+        # message is produced by our extractor and contains no parser
+        # internals or filesystem paths.
+        _remove_upload_artifacts(document_id, document_path)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
     except MaskingRejectedError as error:
         # Fail closed: nothing was embedded or indexed. Remove every
         # artifact so no raw sensitive content remains on disk.
@@ -682,14 +1096,35 @@ async def upload_document(
             detail=str(error),
         ) from error
 
-    except Exception:
-        # Remove the uploaded PDF (and any extracted images) if
-        # processing fails. The internal error is logged server-side and
-        # never returned: it can contain parser details, file paths, or
-        # connection information.
+    except OCRUnavailableError as error:
+        # The scanned-page fallback cannot run without the Tesseract
+        # binary. The message is ours: it names the environment
+        # variable and configured path, and contains no internals.
         _remove_upload_artifacts(document_id, document_path)
 
-        logger.exception("Document processing failed for %s", document_id)
+        logger.error(
+            "Upload rejected for %s: %s", document_id, error
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+
+    except Exception as error:
+        # Remove the uploaded PDF (and any extracted images) if
+        # processing fails, so a failed stage never leaves content on
+        # disk. The full traceback is logged server-side (document id and
+        # exception type only) and never returned to the client: it can
+        # contain parser details, file paths, or connection information.
+        # No document text, PII, or credential is logged here.
+        _remove_upload_artifacts(document_id, document_path)
+
+        logger.exception(
+            "Document processing failed for %s (%s)",
+            document_id,
+            type(error).__name__,
+        )
 
         raise HTTPException(
             status_code=500,
@@ -758,7 +1193,7 @@ def search_documents(request: DocumentSearchRequest):
 # --------------------------------------------------
 
 @app.post("/documents/ask")
-def ask_document(request: RAGRequest):
+def ask_document(request: RAGRequest, db=Depends(get_db_optional)):
     query = request.query.strip()
 
     if not query:
@@ -767,57 +1202,159 @@ def ask_document(request: RAGRequest):
             detail="Question cannot be empty.",
         )
 
+    # When the request explicitly targets a conversation, the same
+    # access checks as POST /chat apply: the conversation must exist
+    # and the caller must own it. This also enables conversation
+    # persistence in the frontend without bypassing ownership.
+    conversation = None
+
+    requested_conversation_id = _normalize_conversation_id(
+        request.conversation_id
+    )
+
+    if requested_conversation_id is not None:
+        conversation = _load_accessible_conversation(
+            db,
+            requested_conversation_id,
+            request.session_id,
+        )
+
+    # If the caller names a document, retrieval is scoped to it. If that
+    # returns nothing, the Context Engine falls back to the stored full
+    # text so a short resume or a scanned PDF still grounds the answer.
+    target_document_id = _validated_document_id(request.document_id)
+
     try:
-        # Assemble all context through one authoritative path.
+        # A named conversation adds conversation, memory and graph
+        # evidence to the document evidence, exactly like POST /chat.
+        if conversation is not None:
+            context = assemble_context(
+                query=query,
+                top_k=request.top_k,
+                document_id=target_document_id,
+                conversation_id=conversation.id,
+                user_id=request.user_id,
+            )
+
+            if target_document_id is not None and not context.get("rag"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The selected document has no retrievable "
+                        "content. Choose a different document or upload "
+                        "a PDF that contains selectable or extracted "
+                        "text."
+                    ),
+                )
+
+            formatted_context = format_context(context)
+
+            # Trusted instructions go to the system role; the assembled
+            # evidence (retrieved chunks, memories, graph, conversation)
+            # is untrusted and stays in the user content. When the
+            # request names a conversation, that conversation's own
+            # custom prompt is composed exactly like POST /chat.
+            system_text, _custom_prompt_applied = build_instructions(
+                custom_prompt=conversation.system_prompt or ""
+            )
+
+            # Resolve image references and avoid sending duplicate image
+            # files to the vision model. Keep the source records
+            # unchanged in the response so the caller can inspect the
+            # original retrieval results.
+            image_paths = []
+            seen_image_paths = set()
+
+            for result in context.get("rag", []):
+                if result.get("content_type") != "image":
+                    continue
+
+                image_path = resolve_image_path(result)
+                if not image_path:
+                    continue
+
+                # Normalize paths so equivalent references count as one.
+                normalized_path = str(Path(image_path).resolve())
+                if normalized_path in seen_image_paths:
+                    continue
+
+                seen_image_paths.add(normalized_path)
+                image_paths.append(normalized_path)
+
+            # Use multimodal inference only when image files exist.
+            if image_paths:
+                answer = generate_multimodal_response(
+                    message=formatted_context,
+                    image_paths=image_paths,
+                    system=system_text,
+                )
+            else:
+                answer = generate_response(
+                    prompt=formatted_context,
+                    system=system_text,
+                )
+
+            return {
+                "query": query,
+                "answer": answer,
+                "sources": {
+                    "conversation": context.get("conversation"),
+                    "memory": context.get("memory", []),
+                    "rag": context.get("rag", []),
+                    "knowledge_graph": context.get(
+                        "knowledge_graph", []
+                    ),
+                },
+                "source_errors": context.get("source_errors", []),
+                "images_sent_to_llm": len(image_paths),
+            }
+
+        # No conversation: document-grounded questions only. Assemble
+        # through the same authoritative path so a resume upload can be
+        # summarised from its extracted text.
         context = assemble_context(
             query=query,
             top_k=request.top_k,
-            document_id=request.document_id,
-            conversation_id=request.conversation_id,
+            document_id=target_document_id,
+            conversation_id=None,
             user_id=request.user_id,
         )
+
+        # With no selected document and no retrievable evidence there is
+        # nothing to ground an answer in. Report that instead of sending
+        # a question-only prompt that invites a fabricated summary.
+        if not target_document_id and not context.get("rag"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No document was selected or uploaded. Upload a PDF "
+                    "first, then ask to summarise it, or re-run the request "
+                    "with a document_id that contains the resume."
+                ),
+            )
+
+        # A selected document with no retrievable text is also a client
+        # error: the model must not invent document content.
+        if target_document_id and not context.get("rag"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "The selected document has no retrievable content. "
+                    "Choose a different document or upload a PDF that "
+                    "contains selectable or extracted text."
+                ),
+            )
 
         formatted_context = format_context(context)
 
         # Trusted instructions go to the system role; the assembled
-        # evidence (retrieved chunks, memories, graph, conversation) is
-        # untrusted and stays in the user content.
+        # evidence is untrusted and stays in the user content.
         system_text, _custom_prompt_applied = build_instructions()
 
-        # Resolve image references and avoid sending duplicate image files
-        # to the vision model. Keep the source records unchanged in the
-        # response so the caller can inspect the original retrieval results.
-        image_paths = []
-        seen_image_paths = set()
-
-        for result in context.get("rag", []):
-            if result.get("content_type") != "image":
-                continue
-
-            image_path = resolve_image_path(result)
-            if not image_path:
-                continue
-
-            # Normalize paths so equivalent references count as one image.
-            normalized_path = str(Path(image_path).resolve())
-            if normalized_path in seen_image_paths:
-                continue
-
-            seen_image_paths.add(normalized_path)
-            image_paths.append(normalized_path)
-
-        # Use multimodal inference only when image files exist.
-        if image_paths:
-            answer = generate_multimodal_response(
-                message=formatted_context,
-                image_paths=image_paths,
-                system=system_text,
-            )
-        else:
-            answer = generate_response(
-                prompt=formatted_context,
-                system=system_text,
-            )
+        answer = generate_response(
+            prompt=formatted_context,
+            system=system_text,
+        )
 
         return {
             "query": query,
@@ -831,8 +1368,11 @@ def ask_document(request: RAGRequest):
                 ),
             },
             "source_errors": context.get("source_errors", []),
-            "images_sent_to_llm": len(image_paths),
+            "images_sent_to_llm": 0,
         }
+
+    except HTTPException:
+        raise
 
     except LLMError as error:
         raise HTTPException(
@@ -861,6 +1401,11 @@ def ask_document(request: RAGRequest):
 # Caveat: when conversation_id is supplied, the conversation branch of
 # assemble_context refreshes the stored conversation summary, which can
 # call the configured LLM once (exactly as POST /documents/ask does).
+# No chat answer is generated; /context/preview never calls
+# generate_response itself.
+#
+# Session ownership matches POST /chat and POST /documents/ask: an
+# unknown or not-owned conversation returns 404.
 
 class ContextPreviewRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10000)
@@ -869,10 +1414,24 @@ class ContextPreviewRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=36)
     user_id: str | None = Field(default=None, max_length=100)
 
+    # Session-ownership claim, mirroring ChatRequest and RAGRequest:
+    # when a conversation_id is supplied, the same access rules as
+    # POST /chat and POST /documents/ask apply to it.
+    session_id: str | None = Field(default=None, max_length=64)
+
 
 @app.post("/context/preview")
-def preview_context(request: ContextPreviewRequest):
-    """Report the context that would be assembled for a question."""
+def preview_context(
+    request: ContextPreviewRequest,
+    db=Depends(get_db_optional),
+):
+    """Report the context that would be assembled for a question.
+
+    Read-only with respect to chat: no answer is generated. When a
+    conversation is supplied, it must exist and the caller must own it
+    under the same session-claim rules as POST /chat and
+    POST /documents/ask.
+    """
 
     query = request.query.strip()
 
@@ -882,12 +1441,30 @@ def preview_context(request: ContextPreviewRequest):
             detail="Query cannot be empty.",
         )
 
+    # Resolve the selected conversation with the same access checks as
+    # the conversational endpoints. Unknown and not-owned conversations
+    # both return 404, so a conversation id cannot be probed.
+    conversation = None
+
+    requested_conversation_id = _normalize_conversation_id(
+        request.conversation_id
+    )
+
+    if requested_conversation_id is not None:
+        conversation = _load_accessible_conversation(
+            db,
+            requested_conversation_id,
+            request.session_id,
+        )
+
     try:
         context = assemble_context(
             query=query,
             top_k=request.top_k,
             document_id=request.document_id,
-            conversation_id=request.conversation_id,
+            conversation_id=(
+                conversation.id if conversation is not None else None
+            ),
             user_id=request.user_id,
         )
 
@@ -926,14 +1503,16 @@ def preview_context(request: ContextPreviewRequest):
         "source_errors": context.get("source_errors", []),
         # Image units that would be attached to a vision request.
         "image_references": image_references,
-        # Prompt/skill identifiers in effect for this question, so the
-        # Context Inspector can show which trusted instructions were
-        # composed into the prompt.
+        # Prompt state in effect for this question (the selected
+        # conversation's custom prompt, if any), so the Context
+        # Inspector can show which trusted instructions were composed
+        # into the prompt.
         "system_prompt": {
-            "using_default": not bool(
-                get_system_prompt()["custom_prompt"].strip()
+            "using_default": not (
+                (conversation.system_prompt or "").strip()
+                if conversation is not None
+                else ""
             ),
-            "active_skill": get_active_skill(),
             "default_prompt_id": "default_system_prompt",
         },
         "model": describe_active_provider(),
@@ -974,9 +1553,14 @@ def mask_text_endpoint(request: MaskingTextRequest):
 
         # Return masked content and metadata only.
         # Never return the original text or raw entity values.
+        # If the secondary validation did not pass, the candidate output
+        # is withheld: it may still contain a value the detectors missed,
+        # so no client can mistake it for approved text.
+        safety_passed = safety["passed"] is True
+
         return {
-            "masked_text": result.masked_text,
-            "safety_passed": safety["passed"],
+            "masked_text": result.masked_text if safety_passed else None,
+            "safety_passed": safety_passed,
             "detected_count": len(result.entities),
             "detected_categories": sorted({
                 entity.entity_type
@@ -998,116 +1582,6 @@ def mask_text_endpoint(request: MaskingTextRequest):
             status_code=500,
             detail="Masking failed. No result was approved.",
         ) from error
-
-
-# --------------------------------------------------
-# System-prompt settings
-# --------------------------------------------------
-# The custom prompt is persisted server-side and prepended to every
-# LLM request. The built-in security instructions are not editable and
-# are always applied on top of the custom prompt.
-
-class SystemPromptUpdateRequest(BaseModel):
-    # Empty string resets to the default (no custom prompt).
-    custom_prompt: str = Field(
-        default="",
-        max_length=MAX_CUSTOM_PROMPT_LENGTH,
-    )
-
-
-@app.get("/settings/system-prompt")
-def read_system_prompt_settings():
-    """Report the stored custom system prompt (and its status)."""
-
-    return {
-        **get_system_prompt(),
-        "security_instructions": SECURITY_INSTRUCTIONS,
-        "max_custom_prompt_length": MAX_CUSTOM_PROMPT_LENGTH,
-    }
-
-
-@app.put("/settings/system-prompt")
-async def update_system_prompt_settings(
-    request: SystemPromptUpdateRequest,
-):
-    """Persist the custom system prompt (empty string resets it)."""
-
-    try:
-        saved = save_system_prompt(request.custom_prompt)
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        ) from error
-
-    except OSError as error:
-        raise HTTPException(
-            status_code=503,
-            detail="The system prompt settings could not be stored.",
-        ) from error
-
-    return {
-        **saved,
-        "security_instructions": SECURITY_INSTRUCTIONS,
-        "max_custom_prompt_length": MAX_CUSTOM_PROMPT_LENGTH,
-    }
-
-
-# --------------------------------------------------
-# Skills (trusted instruction files)
-# --------------------------------------------------
-
-@app.get("/settings/skills")
-def list_available_skills():
-    """List trusted skill files and the currently active skill."""
-
-    return {
-        "skills": list_skills(),
-        "active_skill": get_active_skill(),
-        "default_prompt_id": "default_system_prompt",
-    }
-
-
-class SkillSelectionRequest(BaseModel):
-    skill_id: str = Field(default="", max_length=100)
-
-
-@app.post("/settings/skills/select")
-def select_active_skill(request: SkillSelectionRequest):
-    """Select (or clear) the active skill instruction file."""
-
-    try:
-        if request.skill_id.strip():
-            text = get_skill_text(request.skill_id.strip())
-        else:
-            text = ""
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        ) from error
-
-    try:
-        saved = save_active_skill(request.skill_id.strip())
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        ) from error
-
-    except OSError as error:
-        raise HTTPException(
-            status_code=503,
-            detail="The skill selection could not be stored.",
-        ) from error
-
-    return {
-        **saved,
-        "skill_preview_chars": len(text),
-    }
 
 
 # --------------------------------------------------
@@ -1166,6 +1640,143 @@ def _database_error() -> HTTPException:
 
 
 # --------------------------------------------------
+# Conversation-specific system prompts
+# --------------------------------------------------
+# Every conversation carries its own optional custom system prompt,
+# persisted in PostgreSQL (conversations.system_prompt). There is no
+# global active prompt: selecting another conversation loads its own
+# prompt, and resetting one conversation never affects another. The
+# built-in security instructions are not editable and are always
+# composed on top of the custom prompt by build_instructions, so a
+# custom prompt can never disable them.
+
+class ConversationSystemPromptUpdateRequest(BaseModel):
+    # Empty string resets the conversation to the default instructions.
+    custom_prompt: str = Field(
+        default="",
+        max_length=MAX_CUSTOM_PROMPT_LENGTH,
+    )
+
+
+@app.get("/conversations/{conversation_id}/system-prompt")
+def read_conversation_system_prompt(
+    conversation_id: str,
+    session_id: str | None = Query(default=None, max_length=64),
+    db=Depends(get_db),
+):
+    """Report one conversation's custom system prompt (and status)."""
+
+    conversation = _load_accessible_conversation(
+        db,
+        conversation_id,
+        session_id,
+    )
+
+    try:
+        prompt = get_conversation_system_prompt(
+            db,
+            conversation.id,
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=str(error),
+        ) from error
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    return {
+        **prompt,
+        "security_instructions": SECURITY_INSTRUCTIONS,
+        "max_custom_prompt_length": MAX_CUSTOM_PROMPT_LENGTH,
+    }
+
+
+@app.put("/conversations/{conversation_id}/system-prompt")
+def update_conversation_system_prompt(
+    conversation_id: str,
+    request: ConversationSystemPromptUpdateRequest,
+    session_id: str | None = Query(default=None, max_length=64),
+    db=Depends(get_db),
+):
+    """Persist one conversation's custom system prompt.
+
+    An empty prompt resets the conversation to the default system
+    instructions. Only this conversation is affected.
+    """
+
+    conversation = _load_accessible_conversation(
+        db,
+        conversation_id,
+        session_id,
+    )
+
+    try:
+        saved = save_conversation_system_prompt(
+            db=db,
+            conversation_id=conversation.id,
+            custom_prompt=request.custom_prompt,
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    return {
+        **saved,
+        "security_instructions": SECURITY_INSTRUCTIONS,
+        "max_custom_prompt_length": MAX_CUSTOM_PROMPT_LENGTH,
+    }
+
+
+@app.delete("/conversations/{conversation_id}/system-prompt")
+def delete_conversation_system_prompt(
+    conversation_id: str,
+    session_id: str | None = Query(default=None, max_length=64),
+    db=Depends(get_db),
+):
+    """Reset one conversation to the default system instructions.
+
+    The custom prompt is deleted for this conversation only; its
+    messages and summary are untouched.
+    """
+
+    conversation = _load_accessible_conversation(
+        db,
+        conversation_id,
+        session_id,
+    )
+
+    try:
+        reset = reset_conversation_system_prompt(
+            db=db,
+            conversation_id=conversation.id,
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=str(error),
+        ) from error
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    return {
+        **reset,
+        "security_instructions": SECURITY_INSTRUCTIONS,
+        "max_custom_prompt_length": MAX_CUSTOM_PROMPT_LENGTH,
+    }
+
+
+# --------------------------------------------------
 # Indexed documents
 # --------------------------------------------------
 
@@ -1203,6 +1814,7 @@ def read_documents():
             storage = {
                 "pdf_stored": False,
                 "images_stored": False,
+                "masked_text_stored": False,
             }
 
         documents.append({**document, **storage})
@@ -1256,7 +1868,11 @@ def read_document(document_id: str):
         storage = document_storage_status(document_id)
 
     except ValueError:
-        storage = {"pdf_stored": False, "images_stored": False}
+        storage = {
+            "pdf_stored": False,
+            "images_stored": False,
+            "masked_text_stored": False,
+        }
 
     return {**details, **storage}
 
@@ -1326,20 +1942,31 @@ def delete_document(document_id: str):
 class ConversationCreateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=200)
 
+    # Optional session-ownership claim (trusted, like the memory API's
+    # user_id). Empty/absent keeps the conversation shared.
+    session_id: str | None = Field(default=None, max_length=64)
+
 
 @app.get("/conversations")
 def read_conversations(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    session_id: str | None = Query(default=None, max_length=64),
     db=Depends(get_db),
 ):
-    """List conversations, newest first, with message counts."""
+    """List conversations, newest first, with message counts.
+
+    With ``session_id`` the listing is scoped to that session (shared
+    conversations plus its own). Without it, every conversation is
+    listed, preserving the pre-existing contract.
+    """
 
     try:
         conversations = list_conversations(
             db=db,
             limit=limit,
             offset=offset,
+            session_id=session_id,
         )
 
     except ValueError as error:
@@ -1367,14 +1994,17 @@ def create_new_conversation(
         conversation = create_conversation(
             db,
             title=title or None,
+            session_id=request.session_id,
         )
 
     except SQLAlchemyError as error:
+        logger.exception("Conversation creation failed")
         raise _database_error() from error
 
     return {
         "id": conversation.id,
         "title": conversation.title,
+        "session_id": conversation.session_id,
         "created_at": (
             conversation.created_at.isoformat()
             if conversation.created_at
@@ -1387,9 +2017,13 @@ def create_new_conversation(
 def read_conversation_messages(
     conversation_id: str,
     limit: int = Query(default=50, ge=1, le=200),
+    # "recent" (default) keeps the pre-existing contract: the newest N
+    # messages, newest first. "chronological" returns the earliest
+    # messages first, the natural reading order of a transcript.
+    order: str = Query(default="recent", pattern="^(recent|chronological)$"),
     db=Depends(get_db),
 ):
-    """Return the most recent messages of one conversation."""
+    """Return one conversation's messages."""
 
     try:
         conversation = get_conversation(db, conversation_id)
@@ -1410,11 +2044,19 @@ def read_conversation_messages(
         )
 
     try:
-        messages = get_last_n_messages(
-            db=db,
-            conversation_id=conversation_id,
-            n=limit,
-        )
+        if order == "chronological":
+            messages = list_conversation_messages(
+                db=db,
+                conversation_id=conversation_id,
+                limit=limit,
+                chronological=True,
+            )
+        else:
+            messages = get_last_n_messages(
+                db=db,
+                conversation_id=conversation_id,
+                n=limit,
+            )
 
     except ValueError as error:
         raise HTTPException(
@@ -1428,7 +2070,73 @@ def read_conversation_messages(
     return {
         "conversation_id": conversation_id,
         "title": conversation.title,
+        "order": order,
         "messages": messages,
+    }
+
+
+@app.delete("/conversations/{conversation_id}")
+def remove_conversation(
+    conversation_id: str,
+    session_id: str | None = Query(default=None, max_length=64),
+    db=Depends(get_db),
+):
+    """Delete one conversation with its messages and stored summary.
+
+    The stored summary and every message are removed in the same
+    transaction as the conversation, so no orphaned rows remain. An
+    unknown or not-owned conversation returns 404 without revealing
+    whether it exists.
+    """
+
+    conversation = _load_accessible_conversation(
+        db,
+        conversation_id,
+        session_id,
+    )
+
+    try:
+        result = delete_conversation(db, conversation.id)
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    return {
+        "deleted": result["deleted"],
+        "conversation_id": conversation.id,
+        "messages_deleted": result["messages_deleted"],
+    }
+
+
+@app.delete("/conversations/{conversation_id}/messages")
+def remove_conversation_messages(
+    conversation_id: str,
+    session_id: str | None = Query(default=None, max_length=64),
+    db=Depends(get_db),
+):
+    """Clear one conversation's messages and summary, keeping it.
+
+    Used to implement a safe "reset conversation" that preserves the
+    conversation identifier.
+    """
+
+    conversation = _load_accessible_conversation(
+        db,
+        conversation_id,
+        session_id,
+    )
+
+    try:
+        result = clear_conversation(db, conversation.id)
+
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    return {
+        "cleared": result["cleared"],
+        "conversation_id": conversation.id,
+        "messages_deleted": result["messages_deleted"],
+        "summaries_deleted": result["summaries_deleted"],
     }
 
 
@@ -1663,6 +2371,98 @@ def read_graph_documents(
         ) from None
 
     return {"documents": documents}
+
+
+# --------------------------------------------------
+# Knowledge-graph legacy cleanup (safe by default)
+# --------------------------------------------------
+# The GET endpoint is strictly read-only: it produces the dry-run
+# report without modifying Neo4j. The POST endpoint defaults to the
+# same dry run; destructive changes require an explicit
+# {"confirm": true} body and only ever touch application-owned records.
+
+
+class GraphCleanupRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.get("/knowledge-graph/cleanup-report")
+def read_graph_cleanup_report():
+    """Read-only cleanup report (dry run; nothing is modified)."""
+
+    if not graph_service.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Neo4j is not configured. Set NEO4J_URI and "
+                "NEO4J_PASSWORD in the root .env file."
+            ),
+        )
+
+    try:
+        snapshot = graph_cleanup.fetch_snapshot()
+
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+
+    except Exception:
+        logger.exception("Graph cleanup report failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The cleanup report could not be generated.",
+        ) from None
+
+    return graph_cleanup.build_report(snapshot)
+
+
+@app.post("/knowledge-graph/cleanup")
+def run_graph_cleanup(request: GraphCleanupRequest):
+    """Run the legacy cleanup.
+
+    Default (confirm=false) is a dry run that returns the report and
+    the planned actions without modifying the graph. With
+    confirm=true the plan is executed against application-owned
+    records only, and the remaining-actions counts prove idempotency.
+    """
+
+    if not graph_service.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Neo4j is not configured. Set NEO4J_URI and "
+                "NEO4J_PASSWORD in the root .env file."
+            ),
+        )
+
+    try:
+        result = graph_cleanup.run_cleanup(confirm=request.confirm)
+
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+
+    except Exception:
+        logger.exception("Graph cleanup failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The cleanup could not be executed.",
+        ) from None
+
+    if request.confirm:
+        logger.warning(
+            "Graph cleanup executed (destructive): "
+            "merges=%d removals=%d errors=%d",
+            len(result["applied"]["merges"]),
+            len(result["applied"]["removals"]),
+            len(result["applied"]["errors"]),
+        )
+
+    return result
 
 
 @app.get("/knowledge-graph/documents/{document_id}/entities")

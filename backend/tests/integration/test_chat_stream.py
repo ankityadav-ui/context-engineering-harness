@@ -102,11 +102,9 @@ class FakeStreamProvider:
 
 
 @pytest.fixture(autouse=True)
-def isolated_settings(tmp_path, monkeypatch):
-    """Keep tests independent from any prompt saved on disk."""
-    monkeypatch.setenv(
-        "CEH_SETTINGS_FILE", str(tmp_path / "system_prompt.json")
-    )
+def isolated_settings(monkeypatch):
+    """Keep tests independent from the local Ollama environment."""
+
     monkeypatch.delenv("OLLAMA_VISION_MODEL", raising=False)
 
 
@@ -156,11 +154,12 @@ def read_sse_events(response):
 
 
 def stream_events(client, message, **kwargs):
+    # Extra keyword arguments (e.g. conversation_id) are sent as part
+    # of the JSON request body.
     with client.stream(
         "POST",
         "/chat/stream",
-        json={"message": message},
-        **kwargs,
+        json={"message": message, **kwargs},
     ) as response:
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
@@ -335,17 +334,27 @@ def test_stream_provider_without_streaming_support_reports_error(
 
 
 def test_stream_applies_saved_system_prompt_to_provider(
-    api_client, fake_provider
+    api_client, fake_provider, isolated_assembly
 ):
     provider = fake_provider(["bonjour"])
 
+    # The custom prompt belongs to one conversation and is saved
+    # against it in the database.
+    created = api_client.post(
+        "/conversations", json={"title": "French"}
+    ).json()
+
     saved = api_client.put(
-        "/settings/system-prompt",
+        f"/conversations/{created['id']}/system-prompt",
         json={"custom_prompt": "Answer in French."},
     )
     assert saved.status_code == 200
 
-    events = stream_events(api_client, "Hello?")
+    events = stream_events(
+        api_client,
+        "Hello?",
+        conversation_id=created["id"],
+    )
 
     # The custom instructions reached the provider in the system role,
     # together with the built-in security instructions, while the user

@@ -18,9 +18,7 @@ from app.rag.text_extractor import (
 from app.rag.table_extractor import (
     extract_tables_from_pdf,
 )
-from app.rag.ocr import (
-    extract_text_with_ocr,
-)
+
 # Import the function that generates embeddings.
 from app.rag.embedding_service import embed_content_units
 
@@ -29,6 +27,9 @@ from app.rag.pinecone_service import upsert_content_units
 
 # Import the function that converts extracted content into unified units.
 from app.rag.chunker import build_content_units
+from app.rag.ocr import (
+    extract_text_with_ocr,
+)
 
 # Import the masking + safety pipeline used when masked indexing is
 # requested. Imported lazily inside process_document would also work,
@@ -96,8 +97,74 @@ def resolve_stored_image_dir(document_id: str) -> Path:
     return IMAGE_STORAGE_DIR / validate_document_id(document_id)
 
 
+# Masked uploads never keep the raw PDF. The sanitized text is kept so
+# the Context Engine's full-text fallback can still ground a summary
+# without re-reading (and re-sending) the original document.
+MASKED_TEXT_SUFFIX = ".masked.txt"
+
+
+def resolve_stored_masked_text_path(document_id: str) -> Path:
+    """Return the sanitized full-text artifact path for a document id."""
+
+    return DOCUMENT_STORAGE_DIR / (
+        validate_document_id(document_id) + MASKED_TEXT_SUFFIX
+    )
+
+
+def build_full_text(content_units: list[dict]) -> str:
+    """Join the searchable text of text and table units."""
+
+    return "\n\n".join(
+        unit.get("content", "") or ""
+        for unit in content_units
+        if unit.get("content_type") in {"text", "table"}
+        and str(unit.get("content", "")).strip()
+    )
+
+
+def write_masked_text_artifact(
+    document_id: str,
+    content_units: list[dict],
+) -> Path | None:
+    """Store the masked full text so the fallback never reads raw PII.
+
+    Only safety-validated masked content is passed here. Returns None
+    when there is no text to store.
+    """
+
+    text = build_full_text(content_units)
+
+    if not text.strip():
+        return None
+
+    path = resolve_stored_masked_text_path(document_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+    return path
+
+
+def read_masked_text_artifact(document_id: str) -> str | None:
+    """Return the stored masked full text, or None when absent."""
+
+    try:
+        path = resolve_stored_masked_text_path(document_id)
+    except ValueError:
+        return None
+
+    if not path.is_file():
+        return None
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    return text if text.strip() else None
+
+
 def document_storage_status(document_id: str) -> dict:
-    """Report whether the original PDF and its images exist locally."""
+    """Report which local artifacts exist for one document."""
 
     return {
         "pdf_stored": resolve_stored_document_path(
@@ -106,6 +173,9 @@ def document_storage_status(document_id: str) -> dict:
         "images_stored": resolve_stored_image_dir(
             document_id
         ).is_dir(),
+        "masked_text_stored": resolve_stored_masked_text_path(
+            document_id
+        ).is_file(),
     }
 
 
@@ -135,6 +205,12 @@ def delete_stored_document_files(document_id: str) -> list[str]:
     if pdf_path.is_file():
         pdf_path.unlink()
         removed.append(_display_path(pdf_path))
+
+    masked_text_path = resolve_stored_masked_text_path(document_id)
+
+    if masked_text_path.is_file():
+        masked_text_path.unlink()
+        removed.append(_display_path(masked_text_path))
 
     image_dir = resolve_stored_image_dir(document_id)
 
@@ -209,6 +285,11 @@ def mask_content_units(
     # with each other and cannot be correlated by numbering.
     registry = PlaceholderRegistry()
 
+    # The document header (the first text unit's leading line) is where
+    # the person's name usually sits; the header rule is enabled only
+    # there so body headings are never treated as names.
+    header_pending = True
+
     for unit in content_units:
         if unit.get("content_type") == "image":
             continue
@@ -218,11 +299,19 @@ def mask_content_units(
         if not content.strip():
             continue
 
+        include_header_name = (
+            header_pending and unit.get("content_type") == "text"
+        )
+
         pipeline_output = mask_and_validate(
             text=content,
             document_id=document_id,
             registry=registry,
+            include_header_name=include_header_name,
         )
+
+        if include_header_name:
+            header_pending = False
 
         result = pipeline_output["result"]
         safety = pipeline_output["safety"]
@@ -246,20 +335,20 @@ def mask_content_units(
         "masked_entities": masked_entities,
     }
 
-
-# Process a PDF through extraction, chunking, embedding, and indexing.
-def process_document(
+# Run the OCR fallback for pages the extractor could not read.
+def run_pdf_text_pipeline(
     document_path: Path,
     document_id: str,
-    apply_masking: bool = False,
-) -> tuple[list[dict], list[int], list[dict], list[dict], dict]:
-    # Extract normal PDF text and identify pages that need OCR.
+) -> tuple[list[dict], list[dict], list[dict]]:
+    # Extract selectable text and the pages that need OCR.
     text_units, pages_needing_ocr = extract_text_from_pdf(
         document_path=document_path,
         document_id=document_id,
     )
 
-    # Run OCR only on pages where normal text extraction was insufficient.
+    # Run Tesseract OCR on the pages the extractor could not read.
+    # A valid PDF is never empty here: every page is either retrievable
+    # text or content for the OCR fallback.
     if pages_needing_ocr:
         ocr_units = extract_text_with_ocr(
             document_path=document_path,
@@ -267,8 +356,26 @@ def process_document(
             pages=pages_needing_ocr,
         )
 
-        # Add OCR-generated text to the extracted text collection.
         text_units.extend(ocr_units)
+
+    return text_units, pages_needing_ocr, []
+
+
+# Process a PDF through extraction, chunking, embedding, and indexing.
+
+def process_document(
+    document_path: Path,
+    document_id: str,
+    apply_masking: bool = False,
+) -> tuple[list[dict], list[int], list[dict], list[dict], dict]:
+    # Extract selectable text, run OCR on pages that could not be
+    # parsed, and return a single collection of readable units. This is
+    # the entry point every caller uses so a scanned page is never
+    # silently empty.
+    text_units, pages_needing_ocr, _ = run_pdf_text_pipeline(
+        document_path=document_path,
+        document_id=document_id,
+    )
 
     # Extract structured tables from the PDF.
     table_units = extract_tables_from_pdf(

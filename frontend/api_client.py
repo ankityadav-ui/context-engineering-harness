@@ -94,13 +94,23 @@ def model_info(api_url: str | None = None) -> dict:
 
 def chat(
     message: str,
+    document_id: str | None = None,
     api_url: str | None = None,
 ) -> dict:
-    """Send one chat message (JSON response)."""
+    """Send one chat message (JSON response).
+
+    ``document_id`` scopes retrieval and the full-text fallback to one
+    indexed document, so "summarise this" resolves the uploaded file.
+    """
+
+    payload: dict[str, Any] = {"message": message}
+
+    if document_id:
+        payload["document_id"] = document_id
 
     response = requests.post(
         f"{_base_url(api_url)}/chat",
-        json={"message": message},
+        json=payload,
         timeout=120,
     )
 
@@ -109,17 +119,24 @@ def chat(
 
 def chat_stream(
     message: str,
+    document_id: str | None = None,
     api_url: str | None = None,
 ) -> Iterator[dict]:
     """Stream a chat reply as parsed server-sent events.
 
     Yields {"type": "chunk", "delta": ...}, {"type": "done", ...} and
     {"type": "error", ...} frames exactly as the backend emits them.
+    ``document_id`` has the same document-scoping meaning as :func:`chat`.
     """
+
+    payload: dict[str, Any] = {"message": message}
+
+    if document_id:
+        payload["document_id"] = document_id
 
     stream = requests.post(
         f"{_base_url(api_url)}/chat/stream",
-        json={"message": message},
+        json=payload,
         stream=True,
         timeout=(5, 300),
     )
@@ -170,6 +187,29 @@ def _parse_event(event: str, data_lines: list[str]) -> dict | None:
 # Documents and RAG
 # --------------------------------------------------
 
+def upload_document_file(
+    file_obj,
+    filename: str,
+    mask_content: bool,
+    api_url: str | None = None,
+) -> dict:
+    """Upload one PDF from an open file-like object.
+
+    The backend accepts PDFs only (multipart form field ``file``) with
+    an optional ``mask_content`` flag; processing, OCR, embedding, and
+    indexing all happen server-side before the response is returned.
+    """
+
+    response = requests.post(
+        f"{_base_url(api_url)}/documents/upload",
+        files={"file": (filename, file_obj, "application/pdf")},
+        data={"mask_content": "true" if mask_content else "false"},
+        timeout=900,
+    )
+
+    return _handle(response)
+
+
 def upload_document(
     file_path: str,
     filename: str,
@@ -177,14 +217,12 @@ def upload_document(
     api_url: str | None = None,
 ) -> dict:
     with open(file_path, "rb") as handle:
-        response = requests.post(
-            f"{_base_url(api_url)}/documents/upload",
-            files={"file": (filename, handle, "application/pdf")},
-            data={"mask_content": "true" if mask_content else "false"},
-            timeout=900,
+        return upload_document_file(
+            handle,
+            filename,
+            mask_content,
+            api_url=api_url,
         )
-
-    return _handle(response)
 
 
 def list_documents(api_url: str | None = None) -> dict:
@@ -232,8 +270,16 @@ def ask_question(
     document_id: str | None = None,
     conversation_id: str | None = None,
     user_id: str | None = None,
+    session_id: str | None = None,
     api_url: str | None = None,
 ) -> dict:
+    """Ask a question through the backend RAG pipeline.
+
+    ``conversation_id`` (with its ``session_id`` ownership claim)
+    targets one conversation's history and saved system prompt, using
+    the same access rules as chat.
+    """
+
     response = requests.post(
         f"{_base_url(api_url)}/documents/ask",
         json={
@@ -242,6 +288,7 @@ def ask_question(
             "document_id": document_id or None,
             "conversation_id": conversation_id or None,
             "user_id": user_id or None,
+            "session_id": session_id or None,
         },
         timeout=300,
     )
@@ -258,8 +305,16 @@ def context_preview(
     document_id: str | None = None,
     conversation_id: str | None = None,
     user_id: str | None = None,
+    session_id: str | None = None,
     api_url: str | None = None,
 ) -> dict:
+    """Preview the context the backend would assemble for a question.
+
+    This endpoint never generates a chat answer. ``conversation_id``
+    uses the same session-ownership rules as ``/chat``: a conversation
+    created with a session claim requires that same ``session_id``.
+    """
+
     response = requests.post(
         f"{_base_url(api_url)}/context/preview",
         json={
@@ -268,6 +323,7 @@ def context_preview(
             "document_id": document_id or None,
             "conversation_id": conversation_id or None,
             "user_id": user_id or None,
+            "session_id": session_id or None,
         },
         timeout=300,
     )
@@ -397,36 +453,48 @@ def graph_document_entities(document_id: str, api_url: str | None = None) -> dic
 
 
 # --------------------------------------------------
-# System prompt and skills
+# Conversation-specific system prompts
 # --------------------------------------------------
 
-def get_system_prompt(api_url: str | None = None) -> dict:
+def get_system_prompt(
+    conversation_id: str,
+    api_url: str | None = None,
+) -> dict:
+    """Fetch one conversation's saved system prompt."""
+
     response = requests.get(
-        f"{_base_url(api_url)}/settings/system-prompt", timeout=30
+        f"{_base_url(api_url)}/conversations/{conversation_id}"
+        "/system-prompt",
+        timeout=30,
     )
     return _handle(response)
 
 
-def save_system_prompt(custom_prompt: str, api_url: str | None = None) -> dict:
+def save_system_prompt(
+    conversation_id: str,
+    custom_prompt: str,
+    api_url: str | None = None,
+) -> dict:
+    """Persist one conversation's custom system prompt."""
+
     response = requests.put(
-        f"{_base_url(api_url)}/settings/system-prompt",
+        f"{_base_url(api_url)}/conversations/{conversation_id}"
+        "/system-prompt",
         json={"custom_prompt": custom_prompt},
         timeout=30,
     )
     return _handle(response)
 
 
-def list_skills(api_url: str | None = None) -> dict:
-    response = requests.get(
-        f"{_base_url(api_url)}/settings/skills", timeout=30
-    )
-    return _handle(response)
+def reset_system_prompt(
+    conversation_id: str,
+    api_url: str | None = None,
+) -> dict:
+    """Reset one conversation to the default system instructions."""
 
-
-def select_skill(skill_id: str, api_url: str | None = None) -> dict:
-    response = requests.post(
-        f"{_base_url(api_url)}/settings/skills/select",
-        json={"skill_id": skill_id},
+    response = requests.delete(
+        f"{_base_url(api_url)}/conversations/{conversation_id}"
+        "/system-prompt",
         timeout=30,
     )
     return _handle(response)

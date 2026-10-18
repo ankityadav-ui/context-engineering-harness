@@ -603,9 +603,9 @@ def _build_messages(prompt: str, system: str | None) -> list[dict]:
 def generate_response(prompt: str, system: str | None = None) -> str:
     """Generate a text response for the given user content.
 
-    ``system`` carries the trusted instructions (custom prompt, active
-    skill, built-in security rules). ``prompt`` carries user content and
-    any retrieved context.
+    ``system`` carries the trusted instructions (the conversation's
+    custom prompt plus the built-in security rules). ``prompt`` carries
+    user content and any retrieved context.
     """
 
     if not prompt or not prompt.strip():

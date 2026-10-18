@@ -61,6 +61,14 @@ CONCEPT_TOKENS = frozenset({
     "marketing", "mathematics", "model", "network", "operations",
     "physics", "privacy", "processing", "retrieval", "research",
     "science", "security", "statistics", "system", "testing", "topology",
+    # Generic document/technical artifact words (PDF, NER, OCR, ...).
+    # They describe the medium itself, not an entity, so a stand-alone
+    # mention of one is never a person, organization, or place. This is
+    # a bounded, generic category of document-structure vocabulary -
+    # not a growing list of document-specific exceptions.
+    "api", "csv", "faq", "html", "http", "https", "json",
+    "ner", "ocr", "otp", "pdf", "pdfs", "png", "url", "urls",
+    "uri", "urn", "uuid", "xml",
 })
 
 # Productive nominalizing suffixes: a two-plus-token PERSON label ending in
@@ -139,10 +147,40 @@ def normalize_entity_name(name: str) -> str:
     return " ".join(str(name or "").split()).strip()
 
 
+# Punctuation that never distinguishes two spellings of one entity:
+# separators, terminal punctuation, and wrapper brackets/quotes.
+# Apostrophes are folded too ("O'Brien" == "OBrien"), which is safe
+# because both spellings refer to the same name.
+_COMPARISON_PUNCTUATION = re.compile(r"[.,;:!?\"'\'`()\[\]{}]")
+
+
+def entity_comparison_key(name: str) -> str:
+    """Deterministic identity key used to merge entity spellings.
+
+    NFKC-normalize, casefold, fold harmless punctuation to spaces, and
+    collapse whitespace. Hyphens are preserved so genuinely different
+    names ("Smith-Jones" vs "Smith Jones") are not merged. Used both by
+    graph ingestion (stable node ids) and by the cleanup report.
+    """
+
+    try:
+        import unicodedata
+
+        cleaned = unicodedata.normalize("NFKC", str(name or ""))
+    except (TypeError, ValueError):
+        cleaned = str(name or "")
+
+    cleaned = cleaned.casefold()
+    cleaned = _COMPARISON_PUNCTUATION.sub(" ", cleaned)
+    cleaned = " ".join(cleaned.split())
+
+    return cleaned
+
+
 def entity_name_key(name: str) -> str:
     """Return the case-insensitive identity used to merge entity names."""
 
-    return normalize_entity_name(name).casefold().strip(" .,:;")
+    return entity_comparison_key(name)
 
 
 def is_usable_entity_name(name: str) -> bool:
@@ -241,8 +279,16 @@ def looks_like_person_name(name: str) -> bool:
         return False
 
     if len(tokens) == 1:
-        # A single token is a person only when it is a capitalized word,
-        # which the loop above already guaranteed.
+        # A single all-caps token is an initialism/acronym shape (PDF,
+        # NER, API), not a personal name. Genuine one-word person names
+        # are written with at least one lowercase letter; OCR'd names
+        # in ALL CAPS headings are dropped rather than stored with a
+        # wrong PERSON type.
+        if tokens[0].isupper():
+            return False
+
+        # Otherwise a single token is a person only when it is a
+        # capitalized word, which the loop above already guaranteed.
         return True
 
     last = tokens[-1].casefold()

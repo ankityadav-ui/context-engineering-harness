@@ -21,11 +21,15 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 def test_pinecone_index_requires_configuration_on_use(monkeypatch):
     from app.rag import pinecone_service
 
+    monkeypatch.setattr(pinecone_service, "_client", None)
     monkeypatch.setattr(pinecone_service, "_index", None)
     monkeypatch.delenv("PINECONE_API_KEY", raising=False)
 
     with pytest.raises(RuntimeError, match="PINECONE_API_KEY"):
         pinecone_service.get_index()
+
+    with pytest.raises(RuntimeError, match="PINECONE_API_KEY"):
+        pinecone_service.describe_index_model()
 
 
 def test_gemini_client_requires_configuration_on_use(monkeypatch):

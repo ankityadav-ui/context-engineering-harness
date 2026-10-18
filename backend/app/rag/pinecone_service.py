@@ -33,10 +33,108 @@ MAX_DOCUMENT_UNITS = 1000
 DOCUMENT_UNIT_PAGE_SIZE = 100
 
 
-# Hold the index connection until it is actually needed.
-# Creating the client at import time would stop unrelated API routes
-# from starting when Pinecone is not configured.
+# Hold the control-plane client and the data-plane index handle until
+# they are actually needed. Creating them at import time would stop
+# unrelated API routes from starting when Pinecone is not configured.
+_client: Pinecone | None = None
 _index = None
+
+# Cached index dimension, read once from the live index description so
+# an incompatible vector can never be upserted (see
+# get_index_dimension). None means "not read yet".
+_index_dimension = None
+
+
+def get_client() -> Pinecone:
+    """Return the Pinecone control-plane client (created on first use).
+
+    Index administration (describing an index) lives on this client.
+    ``get_index()`` returns a different object: the data-plane handle
+    used for upsert/query, which has no ``describe_index`` in the
+    current Pinecone SDK.
+    """
+
+    global _client
+
+    if _client is None:
+        api_key = os.getenv("PINECONE_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "PINECONE_API_KEY is not configured. Set it in the "
+                "root .env file to use document retrieval and indexing."
+            )
+
+        _client = Pinecone(api_key=api_key)
+
+    return _client
+
+
+def describe_index_model(name: str | None = None):
+    """Return the index description from the control-plane client.
+
+    The data-plane index handle returned by :func:`get_index` has no
+    ``describe_index``; calling it there raised ``AttributeError`` on
+    every real upload and made the dimension check fail closed.
+    """
+
+    return get_client().describe_index(name or PINECONE_INDEX_NAME)
+
+
+def get_index_dimension() -> int:
+    """Return the configured index dimension, read from Pinecone.
+
+    Supports both classic indexes (``model.dimension``) and
+    model-backed indexes whose dimension lives in the schema's field
+    read parameters. The value is cached per process. The index is
+    never recreated or reconfigured by this call.
+    """
+
+    global _index_dimension
+
+    if _index_dimension is not None:
+        return _index_dimension
+
+    model = describe_index_model()
+
+    dimension = getattr(model, "dimension", None)
+
+    if not isinstance(dimension, int) or dimension <= 0:
+        # Model-backed index: the dense dimension lives in the field
+        # schema (for example llama-text-embed-v2 at 1024).
+        schema = getattr(model, "schema", None)
+        fields = getattr(schema, "fields", None) or {}
+
+        for field in getattr(fields, "values", lambda: [])():
+            read_parameters = (
+                getattr(field, "read_parameters", None) or {}
+            )
+            candidate = read_parameters.get("dimension")
+
+            if isinstance(candidate, int) and candidate > 0:
+                dimension = candidate
+                break
+
+    if not isinstance(dimension, int) or dimension <= 0:
+        raise RuntimeError(
+            "The Pinecone index dimension could not be determined; "
+            "refusing to upsert vectors that cannot be verified "
+            "against the index."
+        )
+
+    _index_dimension = dimension
+
+    return dimension
+
+
+def reset_index_cache() -> None:
+    """Forget the cached client, index handle, and dimension."""
+
+    global _client, _index, _index_dimension
+
+    _client = None
+    _index = None
+    _index_dimension = None
 
 
 def is_configured() -> bool:
@@ -46,22 +144,12 @@ def is_configured() -> bool:
 
 
 def get_index():
-    """Return the Pinecone index, creating the client on first use."""
+    """Return the index handle for upsert/query, created on first use."""
 
     global _index
 
     if _index is None:
-        api_key = os.getenv("PINECONE_API_KEY")
-
-        if not api_key:
-            raise RuntimeError(
-                "PINECONE_API_KEY is not configured. Set it in the "
-                "root .env file to use document retrieval and indexing."
-            )
-
-        _index = Pinecone(api_key=api_key).Index(
-            PINECONE_INDEX_NAME
-        )
+        _index = get_client().Index(PINECONE_INDEX_NAME)
 
     return _index
 
@@ -83,10 +171,30 @@ def upsert_content_units(
     """
     Store multimodal embeddings in the dedicated
     Pinecone namespace.
+
+    Every vector is verified against the live index dimension before
+    it is sent; a mismatch aborts the whole upsert instead of mixing
+    incompatible vectors into the index.
     """
     vectors = []
 
+    expected_dimension = (
+        get_index_dimension() if embedded_units else None
+    )
+
     for unit in embedded_units:
+        embedding = unit.get("embedding") or []
+
+        if (
+            expected_dimension is not None
+            and len(embedding) != expected_dimension
+        ):
+            raise ValueError(
+                "Refusing to upsert a vector with "
+                f"{len(embedding)} dimensions: the configured index "
+                f"expects {expected_dimension}. Nothing was written."
+            )
+
         metadata = {
             "document_id": unit["document_id"],
             "content_type": unit["content_type"],
@@ -114,6 +222,18 @@ def upsert_content_units(
                     "",
                 )
             )
+
+            # Caption / surrounding page context makes the image
+            # retrievable by content, and the content hash lets equal
+            # assets be recognized across documents.
+            metadata["caption"] = (
+                unit["metadata"].get("caption") or ""
+            )
+
+            image_hash = unit["metadata"].get("image_sha256")
+
+            if image_hash:
+                metadata["image_sha256"] = image_hash
 
         vector = {
             "id": unit["id"],
@@ -199,6 +319,9 @@ def search_similar_content(
             result["image_id"] = (
                 metadata["image_id"]
             )
+
+        if "caption" in metadata:
+            result["caption"] = metadata["caption"]
 
         results.append(result)
 
@@ -369,7 +492,12 @@ def get_document_content_units(
                 ),
             }
 
-            for key in ("table_number", "image_id", "content_ref"):
+            for key in (
+                "table_number",
+                "image_id",
+                "content_ref",
+                "caption",
+            ):
                 if metadata.get(key) is not None:
                     unit[key] = metadata[key]
 

@@ -25,6 +25,20 @@ class Conversation(Base):
     # Optional human-readable conversation title.
     title = Column(String(200), nullable=True)
 
+    # Optional per-conversation custom system prompt. NULL means the
+    # conversation uses the default system instructions. Resetting the
+    # prompt sets this back to NULL; it never affects any other
+    # conversation.
+    system_prompt = Column(Text, nullable=True)
+
+    # Optional caller-supplied session claim (session-ownership model).
+    # The application has no authentication system; this mirrors the
+    # trusted-claim pattern used by Memory.user_id. A conversation
+    # without a session_id stays visible to every caller (legacy
+    # behavior); a conversation with one is only accessible to callers
+    # presenting the same session_id.
+    session_id = Column(String(64), nullable=True, index=True)
+
     # Record when the conversation was created.
     created_at = Column(
         DateTime(timezone=True),
