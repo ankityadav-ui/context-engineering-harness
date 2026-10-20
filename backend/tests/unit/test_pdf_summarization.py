@@ -6,7 +6,10 @@ document-grounded ``summarise this`` answer is assembled from the
 uploaded resume instead of the garbled-text fallback.
 """
 
+from types import SimpleNamespace
+
 import io
+import json
 
 import pymupdf
 import pytest
@@ -16,6 +19,8 @@ from PIL import Image
 import app.main as main_module
 from app.main import app
 from app.rag import document_service, embedding_service
+from app.context_engine import summarizer as summarizer_module
+from app.rag import pinecone_service
 
 
 def _png_bytes() -> bytes:
@@ -95,7 +100,12 @@ def pipeline(tmp_path, monkeypatch):
         main_module.graph_service, "is_configured", lambda: False
     )
 
-    record = {"embedded": [], "upserted": 0, "units": []}
+    record = {
+        "embedded": [],
+        "upserted": 0,
+        "upsert_calls": [],
+        "units": [],
+    }
 
     def fake_embed(content_units):
         record["units"] = content_units
@@ -104,10 +114,40 @@ def pipeline(tmp_path, monkeypatch):
 
     def fake_upsert(embedded_units):
         record["upserted"] = len(embedded_units)
+        record["upsert_calls"].append(len(embedded_units))
         return len(embedded_units)
 
     monkeypatch.setattr(document_service, "embed_content_units", fake_embed)
     monkeypatch.setattr(document_service, "upsert_content_units", fake_upsert)
+
+    def fake_searchable_units(document_id):
+        units = [
+            {
+                "unit_id": unit["id"],
+                "document_id": unit["document_id"],
+                "content_type": unit["content_type"],
+                "page_number": unit.get("page_number"),
+                "content": unit.get("content", ""),
+                "source": unit.get("source", "unknown"),
+            }
+            for unit in record["units"]
+            if unit.get("document_id") == document_id
+            and unit.get("content_type") in {"text", "table"}
+        ]
+        return {
+            "document_id": document_id,
+            "document_found": bool(units),
+            "units": units,
+            "page_count": None,
+            "pages_without_text": [],
+            "units_truncated": False,
+        }
+
+    monkeypatch.setattr(
+        pinecone_service,
+        "get_document_searchable_units",
+        fake_searchable_units,
+    )
 
     return {
         "record": record,
@@ -119,7 +159,7 @@ def pipeline(tmp_path, monkeypatch):
 def upload(pdf_path, mask_content="false"):
     with TestClient(app) as client:
         with open(pdf_path, "rb") as handle:
-            return client.post(
+            accepted = client.post(
                 "/documents/upload",
                 files={
                     "file": (
@@ -130,6 +170,32 @@ def upload(pdf_path, mask_content="false"):
                 },
                 data={"mask_content": mask_content},
             )
+        if accepted.status_code != 202:
+            return accepted
+
+        job = client.get(
+            f"/documents/jobs/{accepted.json()['job_id']}"
+        ).json()
+        if job["status"] != "completed":
+            error_code = (job.get("error") or {}).get("code")
+            return SimpleNamespace(
+                status_code={
+                    "invalid_pdf": 400,
+                    "no_retrievable_content": 422,
+                    "masking_rejected": 422,
+                    "embedding_failed": 500,
+                }.get(error_code, 500),
+                text=str(job),
+                json=lambda: {"detail": job["error"]["message"]},
+            )
+        return SimpleNamespace(
+            status_code=200,
+            text=accepted.text,
+            json=lambda: {
+                "document_id": job["document_id"],
+                **job["result"],
+            },
+        )
 
 
 def test_normal_pdf_upload_indexes_and_returns_content_units(tmp_path, pipeline):
@@ -145,6 +211,23 @@ def test_normal_pdf_upload_indexes_and_returns_content_units(tmp_path, pipeline)
     assert body["images_extracted"] >= 1
     assert body["ocr_pages"] == []
     assert body["masking_applied"] is False
+
+
+def test_reprocessing_same_pdf_creates_a_fresh_document_id(
+    tmp_path,
+    pipeline,
+):
+    pdf_path = tmp_path / "repeat.pdf"
+    build_pdf(pdf_path)
+
+    first = upload(pdf_path)
+    second = upload(pdf_path)
+
+    assert first.status_code == second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["document_id"] != second_body["document_id"]
+    assert len(pipeline["record"]["upsert_calls"]) == 2
 
 
 def test_empty_pdf_upload_fails_with_actionable_error(tmp_path):
@@ -179,26 +262,17 @@ def test_document_indexing_failure_is_500_with_no_document_left(tmp_path, pipeli
     response = upload(pdf_path)
 
     assert response.status_code == 500
-    assert "No content was indexed" in response.json()["detail"]
-    assert list(pipeline["document_dir"].glob("*.pdf")) == []
-    assert list(pipeline["image_dir"].glob("*")) == []
+    assert "embedding failed" in response.json()["detail"].lower()
+    # Keep the source available so the same durable job can be retried.
+    assert len(list(pipeline["document_dir"].glob("*.pdf"))) == 1
+    assert list(pipeline["image_dir"].glob("*"))
 
 
-def test_summarise_this_after_upload_uses_stored_full_text(
+def test_summarise_this_after_upload_uses_indexed_units(
     tmp_path, pipeline, monkeypatch
 ):
-    """`summarise this` must be grounded in the uploaded resume.
-
-    Retrieval is stubbed to return nothing, so the Context Engine's
-    full-text fallback is what feeds the model. Embeddings and the vector
-    upsert are stubbed by the pipeline fixture; the rest is the real
-    upload, storage, extraction, and assembly path.
-    """
+    """`summarise this` must be grounded in the selected PDF's source units."""
     import app.context_engine.engine as engine_module
-
-    monkeypatch.setattr(
-        engine_module, "retrieve_context", lambda **kwargs: []
-    )
 
     # One short line keeps the whole resume on page one at the default
     # font size, so nothing is clipped by the page width.
@@ -221,19 +295,22 @@ def test_summarise_this_after_upload_uses_stored_full_text(
 
     prompts = []
 
-    def fake_generate_response(prompt, system=None):
+    def fake_generate_response(prompt):
         prompts.append(prompt)
-
-        if "Sarah Chen" in prompt:
-            return (
-                "Sarah Chen builds recruitment platforms and "
-                "logistics automation."
-            )
-
-        return "I can help with that."
+        sources = json.loads(prompt.split("Sources:\n", 1)[1])
+        return json.dumps(
+            [
+                {
+                    "unit_id": sources[0]["unit_id"],
+                    "quote": sources[0]["text"],
+                }
+            ]
+        )
 
     monkeypatch.setattr(
-        main_module, "generate_response", fake_generate_response
+        summarizer_module,
+        "generate_response",
+        fake_generate_response,
     )
 
     response = TestClient(app).post(
@@ -254,3 +331,52 @@ def test_summarise_this_after_upload_uses_stored_full_text(
     assembled_context = " ".join(prompts)
     assert "Sarah Chen" in assembled_context
     assert "recruitment platforms" in assembled_context
+
+
+def test_summary_retrieval_failure_is_reported_not_fabricated(
+    tmp_path,
+    pipeline,
+    monkeypatch,
+):
+    import app.context_engine.engine as engine_module
+
+    monkeypatch.setattr(
+        pinecone_service,
+        "get_document_searchable_units",
+        lambda _document_id: (_ for _ in ()).throw(
+            RuntimeError("vector store unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        document_service,
+        "read_masked_text_artifact",
+        lambda _document_id: None,
+    )
+    monkeypatch.setattr(
+        document_service,
+        "read_masked_content_units",
+        lambda _document_id: None,
+    )
+    monkeypatch.setattr(
+        document_service,
+        "resolve_stored_document_path",
+        lambda _document_id: tmp_path / "missing.pdf",
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "_get_graph_context",
+        lambda _query: (_ for _ in ()).throw(
+            AssertionError("document summary must not query the graph")
+        ),
+    )
+
+    response = TestClient(app).post(
+        "/documents/ask",
+        json={
+            "query": "summarize this",
+            "document_id": "missing-document",
+        },
+    )
+
+    assert response.status_code == 503
+    assert "could not be read" in response.json()["detail"]

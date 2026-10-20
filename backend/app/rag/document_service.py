@@ -1,9 +1,12 @@
 # This file handles document storage and processing.
 
 import re
+import json
+import time
 from pathlib import Path
 from uuid import uuid4
 import shutil
+from collections.abc import Callable
 
 from fastapi import UploadFile
 # Import the image extraction function.
@@ -101,6 +104,8 @@ def resolve_stored_image_dir(document_id: str) -> Path:
 # the Context Engine's full-text fallback can still ground a summary
 # without re-reading (and re-sending) the original document.
 MASKED_TEXT_SUFFIX = ".masked.txt"
+MASKED_UNITS_SUFFIX = ".masked.units.json"
+PLACEHOLDER_PATTERN = re.compile(r"\[[A-Z][A-Z0-9_]*_\d+\]")
 
 
 def resolve_stored_masked_text_path(document_id: str) -> Path:
@@ -108,6 +113,14 @@ def resolve_stored_masked_text_path(document_id: str) -> Path:
 
     return DOCUMENT_STORAGE_DIR / (
         validate_document_id(document_id) + MASKED_TEXT_SUFFIX
+    )
+
+
+def resolve_stored_masked_units_path(document_id: str) -> Path:
+    """Return the sanitized, page-aware source-unit artifact path."""
+
+    return DOCUMENT_STORAGE_DIR / (
+        validate_document_id(document_id) + MASKED_UNITS_SUFFIX
     )
 
 
@@ -141,7 +154,91 @@ def write_masked_text_artifact(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
 
+    source_units = [
+        {
+            "unit_id": unit["id"],
+            "document_id": document_id,
+            "content_type": unit["content_type"],
+            "page_number": unit["page_number"],
+            "content": unit["content"],
+            "source": unit.get("metadata", {}).get(
+                "source",
+                "unknown",
+            ),
+        }
+        for unit in content_units
+        if unit.get("content_type") in {"text", "table"}
+        and isinstance(unit.get("content"), str)
+        and unit["content"].strip()
+    ]
+    first_metadata = next(
+        (
+            unit.get("metadata", {})
+            for unit in content_units
+            if unit.get("content_type") in {"text", "table"}
+        ),
+        {},
+    )
+    units_path = resolve_stored_masked_units_path(document_id)
+    units_path.write_text(
+        json.dumps(
+            {
+                "document_id": document_id,
+                "page_count": first_metadata.get("page_count"),
+                "pages_without_text": first_metadata.get(
+                    "pages_without_text",
+                    [],
+                ),
+                "units": source_units,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
     return path
+
+
+def read_masked_content_units(document_id: str) -> dict | None:
+    """Read safe page-aware source units for a masked document."""
+
+    path = resolve_stored_masked_units_path(document_id)
+    if not path.is_file():
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "The stored masked source-unit artifact could not be read."
+        ) from error
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("document_id") != document_id
+        or not isinstance(payload.get("units"), list)
+    ):
+        raise RuntimeError(
+            "The stored masked source-unit artifact is invalid."
+        )
+
+    for unit in payload["units"]:
+        if (
+            not isinstance(unit, dict)
+            or unit.get("document_id") != document_id
+            or unit.get("content_type") not in {"text", "table"}
+            or not isinstance(unit.get("unit_id"), str)
+            or not isinstance(unit.get("content"), str)
+            or (
+                unit.get("page_number") is not None
+                and not isinstance(unit.get("page_number"), int)
+            )
+        ):
+            raise RuntimeError(
+                "The stored masked source-unit artifact is invalid."
+            )
+
+    return payload
 
 
 def read_masked_text_artifact(document_id: str) -> str | None:
@@ -174,6 +271,9 @@ def document_storage_status(document_id: str) -> dict:
             document_id
         ).is_dir(),
         "masked_text_stored": resolve_stored_masked_text_path(
+            document_id
+        ).is_file(),
+        "masked_units_stored": resolve_stored_masked_units_path(
             document_id
         ).is_file(),
     }
@@ -217,6 +317,11 @@ def delete_stored_document_files(document_id: str) -> list[str]:
     if image_dir.is_dir():
         shutil.rmtree(image_dir)
         removed.append(_display_path(image_dir) + "/")
+
+    masked_units_path = resolve_stored_masked_units_path(document_id)
+    if masked_units_path.is_file():
+        masked_units_path.unlink()
+        removed.append(_display_path(masked_units_path))
 
     return removed
 
@@ -278,12 +383,12 @@ def mask_content_units(
     content_units: list[dict],
     document_id: str,
 ) -> dict:
-    masked_entities = 0
-
     # One registry for the whole document: the same value receives the
     # same placeholder in every chunk, so masked chunks stay consistent
     # with each other and cannot be correlated by numbering.
     registry = PlaceholderRegistry()
+    existing_placeholders: set[str] = set()
+    existing_placeholder_occurrences = 0
 
     # The document header (the first text unit's leading line) is where
     # the person's name usually sits; the header rule is enabled only
@@ -298,6 +403,10 @@ def mask_content_units(
 
         if not content.strip():
             continue
+
+        found_placeholders = PLACEHOLDER_PATTERN.findall(content)
+        existing_placeholders.update(found_placeholders)
+        existing_placeholder_occurrences += len(found_placeholders)
 
         include_header_name = (
             header_pending and unit.get("content_type") == "text"
@@ -325,23 +434,27 @@ def mask_content_units(
                 + "; ".join(safety.get("reasons", []))
                 + "). Nothing was embedded or indexed."
             )
-
         unit["content"] = result.masked_text
-        masked_entities += len(result.entities)
 
     return {
         "applied": True,
         "safety_passed": True,
-        "masked_entities": masked_entities,
+        "masked_entities": registry.masked_value_count(),
+        "existing_placeholders": len(existing_placeholders),
+        "existing_placeholder_occurrences": existing_placeholder_occurrences,
     }
 
 # Run the OCR fallback for pages the extractor could not read.
 def run_pdf_text_pipeline(
     document_path: Path,
     document_id: str,
+    on_stage: Callable[[str, str, float, str | None], None] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     # Extract selectable text and the pages that need OCR.
-    text_units, pages_needing_ocr = extract_text_from_pdf(
+    text_units, pages_needing_ocr = _run_timed_stage(
+        "text_extraction",
+        on_stage,
+        extract_text_from_pdf,
         document_path=document_path,
         document_id=document_id,
     )
@@ -350,7 +463,10 @@ def run_pdf_text_pipeline(
     # A valid PDF is never empty here: every page is either retrievable
     # text or content for the OCR fallback.
     if pages_needing_ocr:
-        ocr_units = extract_text_with_ocr(
+        ocr_units = _run_timed_stage(
+            "ocr",
+            on_stage,
+            extract_text_with_ocr,
             document_path=document_path,
             document_id=document_id,
             pages=pages_needing_ocr,
@@ -361,12 +477,45 @@ def run_pdf_text_pipeline(
     return text_units, pages_needing_ocr, []
 
 
+def _run_timed_stage(
+    stage: str,
+    callback: Callable[[str, str, float, str | None], None] | None,
+    operation: Callable,
+    *args,
+    **kwargs,
+):
+    started = time.perf_counter()
+    if callback is not None:
+        callback(stage, "running", 0.0, None)
+    try:
+        result = operation(*args, **kwargs)
+    except Exception as error:
+        if callback is not None:
+            callback(
+                stage,
+                "failed",
+                (time.perf_counter() - started) * 1000,
+                type(error).__name__,
+            )
+        raise
+    if callback is not None:
+        callback(
+            stage,
+            "completed",
+            (time.perf_counter() - started) * 1000,
+            None,
+        )
+    return result
+
+
 # Process a PDF through extraction, chunking, embedding, and indexing.
 
 def process_document(
     document_path: Path,
     document_id: str,
     apply_masking: bool = False,
+    on_indexing_started: Callable[[], None] | None = None,
+    on_stage: Callable[[str, str, float, str | None], None] | None = None,
 ) -> tuple[list[dict], list[int], list[dict], list[dict], dict]:
     # Extract selectable text, run OCR on pages that could not be
     # parsed, and return a single collection of readable units. This is
@@ -375,10 +524,14 @@ def process_document(
     text_units, pages_needing_ocr, _ = run_pdf_text_pipeline(
         document_path=document_path,
         document_id=document_id,
+        on_stage=on_stage,
     )
 
     # Extract structured tables from the PDF.
-    table_units = extract_tables_from_pdf(
+    table_units = _run_timed_stage(
+        "table_extraction",
+        on_stage,
+        extract_tables_from_pdf,
         document_path=document_path,
         document_id=document_id,
     )
@@ -389,18 +542,41 @@ def process_document(
     if apply_masking:
         image_units = []
     else:
-        image_units = extract_images_from_pdf(
+        image_units = _run_timed_stage(
+            "image_extraction",
+            on_stage,
+            extract_images_from_pdf,
             document_path=document_path,
             document_id=document_id,
             image_storage_dir=IMAGE_STORAGE_DIR,
         )
 
     # Convert text, tables, and images into unified content units.
-    content_units = build_content_units(
+    content_units = _run_timed_stage(
+        "chunking",
+        on_stage,
+        build_content_units,
         text_units=text_units,
         table_units=table_units,
         image_units=image_units,
     )
+    from app.rag.text_extractor import get_pdf_page_count
+
+    page_count = get_pdf_page_count(document_path)
+    text_pages = {
+        unit["page_number"]
+        for unit in content_units
+        if unit.get("content_type") in {"text", "table"}
+        and unit.get("page_number") is not None
+        and str(unit.get("content", "")).strip()
+    }
+    pages_without_text = [
+        page for page in range(1, page_count + 1)
+        if page not in text_pages
+    ]
+    for unit in content_units:
+        unit["metadata"]["page_count"] = page_count
+        unit["metadata"]["pages_without_text"] = pages_without_text
 
     # When masking is requested, sanitize every text-bearing unit
     # BEFORE embedding or indexing. If the safety validation fails the
@@ -409,23 +585,37 @@ def process_document(
         "applied": False,
         "safety_passed": None,
         "masked_entities": 0,
+        "existing_placeholders": 0,
+        "existing_placeholder_occurrences": 0,
     }
 
     if apply_masking:
-        masking_stats = mask_content_units(
+        masking_stats = _run_timed_stage(
+            "masking",
+            on_stage,
+            mask_content_units,
             content_units=content_units,
             document_id=document_id,
         )
 
     # Generate embeddings for all content units (masked content when
     # masking was requested).
-    embedded_units = embed_content_units(
-        content_units
+    embedded_units = _run_timed_stage(
+        "embedding",
+        on_stage,
+        embed_content_units,
+        content_units,
     )
 
+    if on_indexing_started is not None:
+        on_indexing_started()
+
     # Store the generated vectors and metadata in Pinecone.
-    upsert_content_units(
-        embedded_units
+    _run_timed_stage(
+        "pinecone_indexing",
+        on_stage,
+        upsert_content_units,
+        embedded_units,
     )
 
     # Return the processed content and extraction statistics.

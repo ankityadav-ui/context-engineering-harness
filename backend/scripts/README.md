@@ -3,8 +3,9 @@
 The `manual_*.py` files in this directory are **not automated tests**.
 The pytest suite only collects `tests/` (`python_files = test_*.py`), so
 these scripts are never executed by `python -m pytest`. Each one exercises
-a real external service (PostgreSQL, Neo4j, Pinecone, Gemini embeddings,
-or the Ollama/OpenRouter LLMs) and several of them **write** data.
+a real external service (PostgreSQL, Neo4j, Pinecone, or Gemini generation
+and embeddings) and several of them **write**
+data.
 
 ## Safety: opt-in is required
 

@@ -56,6 +56,22 @@ def _handle(response: requests.Response) -> dict[str, Any]:
 
 
 # --------------------------------------------------
+
+
+def delete_conversation(conversation_id: str, session_id: str | None = None, api_url: str | None = None) -> dict:
+    """Delete one conversation with its messages and stored summary.
+
+    The conversation, its messages, and its conversation-specific summary
+    are removed in the same transaction. An unknown or not-owned
+    conversation returns 404 without revealing whether it exists.
+    """
+    url = f"{_base_url(api_url)}/conversations/{conversation_id}"
+    params: dict[str, str] = {}
+    if session_id:
+        params["session_id"] = session_id
+    response = requests.delete(url, params=params, timeout=30)
+    return _handle(response)
+
 # Health, capabilities, and model info
 # --------------------------------------------------
 
@@ -86,7 +102,6 @@ def model_info(api_url: str | None = None) -> dict:
             }
 
     return {"model": "unknown", "configured": False}
-
 
 # --------------------------------------------------
 # Chat
@@ -192,19 +207,26 @@ def upload_document_file(
     filename: str,
     mask_content: bool,
     api_url: str | None = None,
+    *,
+    idempotency_key: str | None = None,
 ) -> dict:
     """Upload one PDF from an open file-like object.
 
     The backend accepts PDFs only (multipart form field ``file``) with
     an optional ``mask_content`` flag; processing, OCR, embedding, and
-    indexing all happen server-side before the response is returned.
+    indexing continue in a durable backend job after an HTTP 202 response.
     """
 
     response = requests.post(
         f"{_base_url(api_url)}/documents/upload",
         files={"file": (filename, file_obj, "application/pdf")},
         data={"mask_content": "true" if mask_content else "false"},
-        timeout=900,
+        headers=(
+            {"Idempotency-Key": idempotency_key}
+            if idempotency_key
+            else {}
+        ),
+        timeout=60,
     )
 
     return _handle(response)
@@ -215,6 +237,8 @@ def upload_document(
     filename: str,
     mask_content: bool,
     api_url: str | None = None,
+    *,
+    idempotency_key: str | None = None,
 ) -> dict:
     with open(file_path, "rb") as handle:
         return upload_document_file(
@@ -222,7 +246,30 @@ def upload_document(
             filename,
             mask_content,
             api_url=api_url,
+            idempotency_key=idempotency_key,
         )
+
+
+def get_ingestion_job(
+    job_id: str,
+    api_url: str | None = None,
+) -> dict:
+    response = requests.get(
+        f"{_base_url(api_url)}/documents/jobs/{job_id}",
+        timeout=10,
+    )
+    return _handle(response)
+
+
+def retry_ingestion_job(
+    job_id: str,
+    api_url: str | None = None,
+) -> dict:
+    response = requests.post(
+        f"{_base_url(api_url)}/documents/jobs/{job_id}/retry",
+        timeout=15,
+    )
+    return _handle(response)
 
 
 def list_documents(api_url: str | None = None) -> dict:
@@ -413,40 +460,22 @@ def delete_memory(memory_id: int, user_id: str, api_url: str | None = None) -> d
 
 
 # --------------------------------------------------
-# Knowledge graph
+# Knowledge graph cleanup
 # --------------------------------------------------
+# The knowledge graph is an internal backend service (Neo4j): entity
+# browsing was removed from the UI, and the only graph call the
+# frontend still makes is the read-only cleanup report shown on the
+# Diagnostics page.
 
-def graph_entities(
-    search: str | None = None,
-    limit: int = 25,
-    api_url: str | None = None,
-) -> dict:
+def cleanup_report(api_url: str | None = None) -> dict:
+    """Read-only cleanup report (dry run; nothing is modified).
+
+    Calls the backend /knowledge-graph/cleanup-report endpoint which returns
+    a report of orphaned/uncertain records without performing any deletions.
+    Use the ``mode`` field to confirm the report is read-only.
+    """
     response = requests.get(
-        f"{_base_url(api_url)}/knowledge-graph/entities",
-        params={"search": search or None, "limit": limit},
-        timeout=60,
-    )
-    return _handle(response)
-
-
-def entity_relationships(entity_id: str, api_url: str | None = None) -> dict:
-    response = requests.get(
-        f"{_base_url(api_url)}/knowledge-graph/entities/{entity_id}/relationships",
-        timeout=60,
-    )
-    return _handle(response)
-
-
-def graph_documents(api_url: str | None = None) -> dict:
-    response = requests.get(
-        f"{_base_url(api_url)}/knowledge-graph/documents", timeout=60
-    )
-    return _handle(response)
-
-
-def graph_document_entities(document_id: str, api_url: str | None = None) -> dict:
-    response = requests.get(
-        f"{_base_url(api_url)}/knowledge-graph/documents/{document_id}/entities",
+        f"{_base_url(api_url)}/knowledge-graph/cleanup-report",
         timeout=60,
     )
     return _handle(response)

@@ -21,8 +21,11 @@ python-multipart==0.0.32        # multipart/form-data (FastAPI file uploads)
 pydantic==2.13.4
 
 # --- LLM providers ---
-ollama==0.6.2                   # local text + vision provider
-httpx==0.28.1                   # OpenRouter HTTP client and retry logic
+httpx==0.28.1                   # HTTP transport used by provider clients
+langchain-core==1.6.12          # shared LangChain model and document interfaces
+langchain-experimental==0.4.2   # LLMGraphTransformer for graph extraction
+langchain-google-genai==3.2.0   # Gemini chat, multimodal, and structured output
+langchain-ollama==1.1.0         # Explicit opt-in local text fallback
 
 # --- Embeddings (Gemini) ---
 google-genai==2.14.0

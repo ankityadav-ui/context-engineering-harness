@@ -214,6 +214,34 @@ def test_document_details_describe_units_without_returning_text(
     assert "Confidential patient record." not in response.text
 
 
+def test_searchable_summary_units_keep_exact_document_and_page_metadata(
+    fake_index,
+):
+    result = pinecone_service.get_document_searchable_units("doc-alpha")
+
+    assert result["document_id"] == "doc-alpha"
+    assert [unit["unit_id"] for unit in result["units"]] == [
+        "unit-1",
+        "unit-2",
+    ]
+    assert [unit["page_number"] for unit in result["units"]] == [1, 2]
+    assert all(
+        unit["document_id"] == "doc-alpha"
+        for unit in result["units"]
+    )
+    assert all(unit["content_type"] in {"text", "table"} for unit in result["units"])
+
+
+def test_searchable_summary_units_report_bounded_results(fake_index):
+    result = pinecone_service.get_document_searchable_units(
+        "doc-alpha",
+        max_units=1,
+    )
+
+    assert len(result["units"]) == 1
+    assert result["units_truncated"] is True
+
+
 def test_unknown_document_returns_404(fake_index):
     with TestClient(app) as client:
         response = client.get("/documents/doc-missing")

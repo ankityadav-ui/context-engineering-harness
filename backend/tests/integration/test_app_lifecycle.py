@@ -52,7 +52,7 @@ def test_shutdown_releases_every_external_resource(recorded_cleanup):
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
 
-    # Neo4j, PostgreSQL, and the Ollama client are all released.
+    # Neo4j, PostgreSQL, and the Gemini model are all released.
     assert recorded_cleanup == ["graph", "database", "llm"]
 
 

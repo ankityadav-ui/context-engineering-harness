@@ -112,14 +112,21 @@ def extract_tables_from_pdf(
                 # Treat remaining rows as data.
                 data_rows = cleaned_rows[1:]
 
-                # Generate a document-level table number.
-                table_counter += 1
-
                 # Create searchable table text.
                 searchable_text = table_to_searchable_text(
                     headers=headers,
                     rows=data_rows,
                 )
+
+                # A header-only table (or one whose remaining rows carry
+                # no values) has nothing retrievable to index. Keeping it
+                # produced an empty content unit, which the embedding
+                # stage rejects and the upload fails as a whole.
+                if not searchable_text.strip():
+                    continue
+
+                # Generate a document-level table number.
+                table_counter += 1
 
                 # Create the multimodal content unit.
                 table_unit = {

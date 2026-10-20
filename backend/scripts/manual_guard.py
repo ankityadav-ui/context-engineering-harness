@@ -2,7 +2,7 @@
 
 Manual scripts are named ``manual_*.py`` so pytest never collects them.
 They talk to live external services (PostgreSQL, Neo4j, Pinecone,
-Gemini, Ollama/OpenRouter) and several of them write test data.
+Gemini) and several of them write test data.
 
 To avoid accidental writes or paid API calls, every manual script calls
 ``require_live_opt_in()`` before performing any external operation.

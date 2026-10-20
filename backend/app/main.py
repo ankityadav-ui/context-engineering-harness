@@ -1,14 +1,18 @@
 
 # Import FastAPI's request validation tools.
 import json
-
+import hashlib
+import math
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
 # Import the masking and safety pipeline.
 from app.masking.safety_pipeline import mask_and_validate
 
 import logging
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,6 +20,7 @@ import os
 
 from fastapi import (
     Depends,
+    Header,
     FastAPI,
     File,
     Form,
@@ -62,12 +67,16 @@ from app.rag.pinecone_service import (
 # Importing them does not connect to anything: each client is created on
 # first use (see the is_configured() helper in each module).
 from app.context_engine import database as context_database
-from app.context_engine import graph_cleanup, graph_service
+from app.context_engine import graph_cleanup, graph_service, ingestion_jobs
 from app.rag import embedding_service, ocr, pinecone_service
 from app.context_engine.engine import (
     assemble_context,
+    build_context_diagnostics,
+    build_context_report,
     format_context,
+    is_summary_request,
 )
+from app.context_engine.summarizer import summarize_document_units
 from app.context_engine.conversation_service import (
     clear_conversation,
     conversation_accessible,
@@ -84,14 +93,20 @@ from app.context_engine.conversation_service import (
     save_message,
 )
 from app.context_engine.graph_service import (
+    find_entity_documents,
     find_document_entities,
+    find_document_graph,
     find_entities,
+    get_entity_neighborhood,
     get_entity_relationships,
+    graph_counts,
     ingest_document_graph,
     list_documents,
     list_entities,
+    verify_graph_connection,
 )
 from app.context_engine.memory_service import (
+    count_memories,
     create_memory,
     delete_memory,
     list_memories,
@@ -101,6 +116,10 @@ from app.system_prompt import (
     SECURITY_INSTRUCTIONS,
     build_instructions,
 )
+
+
+class NoRetrievableContentError(PDFProcessingError):
+    """Raised when a valid PDF yields no indexable content units."""
 
 
 # --------------------------------------------------
@@ -148,6 +167,28 @@ def _configure_logging() -> None:
 _configure_logging()
 
 logger = logging.getLogger("app.main")
+_INGESTION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="document-ingestion",
+)
+_SCHEDULED_INGESTION_JOBS: set[str] = set()
+_SCHEDULED_INGESTION_LOCK = threading.Lock()
+
+
+def _llm_http_exception(error: LLMError) -> HTTPException:
+    headers = {
+        "X-Error-Code": error.code,
+        "X-Retryable": "true" if error.retryable else "false",
+    }
+    if error.retry_after_seconds is not None:
+        headers["Retry-After"] = str(
+            max(1, math.ceil(error.retry_after_seconds))
+        )
+    return HTTPException(
+        status_code=503,
+        detail=str(error),
+        headers=headers,
+    )
 
 
 @asynccontextmanager
@@ -168,6 +209,28 @@ async def lifespan(app: FastAPI):
         logger.info(
             "LLM startup check passed (model=%s)", validation["model"]
         )
+
+    if (
+        context_database.is_configured()
+        and os.getenv("INGESTION_JOB_RECOVERY_ENABLED", "true")
+        .strip()
+        .casefold()
+        in {"1", "true", "yes"}
+    ):
+        try:
+            recovered_job_ids = ingestion_jobs.recover_interrupted_jobs()
+            for recovered_job_id in recovered_job_ids:
+                _schedule_ingestion_job(recovered_job_id)
+            if recovered_job_ids:
+                logger.info(
+                    "Recovered interrupted ingestion jobs count=%s",
+                    len(recovered_job_ids),
+                )
+        except Exception as error:
+            logger.warning(
+                "Ingestion job recovery unavailable code=%s",
+                type(error).__name__,
+            )
 
     try:
         yield
@@ -301,14 +364,10 @@ def read_capabilities():
         "services": [
             {
                 "key": "llm",
-                "label": f"Language model (Ollama, {llm_active['backend']})",
+                "label": "Language model (Google Gemini)",
                 "configured": llm_is_configured(),
                 "model": llm_active["model"],
-                "required_env": (
-                    ["OLLAMA_TEXT_MODEL", "Ollama_API_KEY"]
-                    if llm_active["backend"] == "cloud"
-                    else ["OLLAMA_TEXT_MODEL"]
-                ),
+                "required_env": ["GEMINI_API_KEY"],
             },
             {
                 "key": "embeddings",
@@ -482,10 +541,7 @@ def chat(request: ChatRequest, db=Depends(get_db_optional)):
             }
 
         except LLMError as error:
-            raise HTTPException(
-                status_code=503,
-                detail=str(error),
-            ) from error
+            raise _llm_http_exception(error) from error
 
     # Persistent chat: everything is assembled through the single
     # authoritative context path, which reads the conversation's
@@ -524,10 +580,56 @@ def chat(request: ChatRequest, db=Depends(get_db_optional)):
             detail=str(error),
         ) from error
 
-    # A selected document with no retrievable content (after vector
-    # retrieval and the full-text fallback) cannot support a grounded
-    # answer. Report that instead of inviting a fabricated summary.
-    if target_document_id is not None and not context.get("rag"):
+    document_summary = (
+        target_document_id is not None and is_summary_request(message)
+    )
+
+    if (
+        document_summary
+        and not context.get("rag")
+        and context.get("source_errors")
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The selected document could not be read for a grounded "
+                "summary. Check document retrieval and try again."
+            ),
+        )
+
+    if context.get("document_summary_info", {}).get(
+        "source_provenance_unavailable"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The stored masked text has no page/chunk provenance. "
+                "Reprocess the PDF before requesting a grounded summary."
+            ),
+        )
+
+    if (
+        document_summary
+        and context.get("document_summary_info", {}).get(
+            "document_found"
+        ) is False
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The selected document has no indexed content. "
+                "Reprocess the PDF or select a different document."
+            ),
+        )
+
+    # A selected document with no retrievable content cannot support a
+    # normal grounded answer. Summary requests can accurately report that
+    # extraction/OCR found no text without asking the model to invent it.
+    if (
+        target_document_id is not None
+        and not context.get("rag")
+        and not document_summary
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -539,7 +641,9 @@ def chat(request: ChatRequest, db=Depends(get_db_optional)):
 
     # An empty retrieval result without a document scope is a
     # legitimate outcome: chat works without uploaded documents.
-    formatted_context = format_context(context)
+    formatted_context = (
+        None if document_summary else format_context(context)
+    )
 
     # Persist the user turn only after the context was assembled, so
     # the current message is never duplicated inside its own context.
@@ -547,18 +651,31 @@ def chat(request: ChatRequest, db=Depends(get_db_optional)):
         _save_chat_message(db, conversation.id, "user", message)
 
     try:
-        answer = generate_response(
-            prompt=formatted_context,
-            system=system_text,
-        )
+        if document_summary:
+            summary_info = context.get("document_summary_info", {})
+            if summary_info.get("units_truncated"):
+                raise LLMError(
+                    "The document exceeds the safe whole-document "
+                    "summary limit. Narrow the document or reprocess it "
+                    "into smaller documents."
+                )
+            answer = summarize_document_units(
+                units=context.get("rag", []),
+                document_id=target_document_id,
+                pages_without_text=summary_info.get(
+                    "pages_without_text", []
+                ),
+            )
+        else:
+            answer = generate_response(
+                prompt=formatted_context,
+                system=system_text,
+            )
 
     except LLMError as error:
         # Fail-closed persistence: the user turn is stored, but no
         # assistant answer is saved for a failed generation.
-        raise HTTPException(
-            status_code=503,
-            detail=str(error),
-        ) from error
+        raise _llm_http_exception(error) from error
 
     if conversation is None:
         return {
@@ -617,6 +734,50 @@ def _describe_conversation_context(context: dict) -> dict:
         "recent_count": conversation.get("recent_count", 0),
         "summary_present": bool(conversation.get("summary")),
     }
+
+
+def _summarize_document_context(context: dict, document_id: str) -> str:
+    summary_info = context.get("document_summary_info", {})
+
+    if summary_info.get("source_provenance_unavailable"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The stored masked text has no page/chunk provenance. "
+                "Reprocess the PDF before requesting a grounded summary."
+            ),
+        )
+
+    if (
+        summary_info.get("document_found") is False
+        and not context.get("rag")
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="The selected document was not found in the index or storage.",
+        )
+
+    if summary_info.get("units_truncated"):
+        raise LLMError(
+            "The document exceeds the safe whole-document summary "
+            "limit. Narrow the document or reprocess it into smaller "
+            "documents."
+        )
+
+    if not context.get("rag") and context.get("source_errors"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The selected document could not be read for a grounded "
+                "summary. Check document retrieval and try again."
+            ),
+        )
+
+    return summarize_document_units(
+        units=context.get("rag", []),
+        document_id=document_id,
+        pages_without_text=summary_info.get("pages_without_text", []),
+    )
 
 
 # --------------------------------------------------
@@ -811,6 +972,9 @@ def chat_stream(
                 "error",
                 {
                     "detail": str(error),
+                    "code": error.code,
+                    "retryable": error.retryable,
+                    "retry_after_seconds": error.retry_after_seconds,
                     "partial": "".join(emitted),
                 },
             )
@@ -891,6 +1055,7 @@ async def _read_upload_bytes(file: UploadFile) -> bytes:
 def _remove_upload_artifacts(
     document_id: str,
     document_path: Path,
+    remove_indexed_content: bool = False,
 ) -> None:
     """Best-effort removal of a failed upload's stored artifacts.
 
@@ -909,145 +1074,218 @@ def _remove_upload_artifacts(
         delete_stored_document_files(document_id)
 
     except Exception:
-        # Cleanup is best-effort; the original failure is reported.
-        pass
-
-
-@app.post("/documents/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    # Optional multipart field; when "true", extracted text (including
-    # OCR output) is masked and re-validated BEFORE embedding/indexing.
-    mask_content: str = Form(default="false"),
-):
-    if (
-        not file.filename
-        or Path(file.filename).suffix.lower() != ".pdf"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a PDF file.",
+        logger.warning(
+            "Could not remove local artifacts for failed document %s.",
+            document_id,
         )
 
-    apply_masking = _parse_mask_flag(mask_content)
+    if remove_indexed_content:
+        try:
+            delete_document_from_index(document_id)
+        except Exception as error:
+            # This id was generated for the in-flight upload, not an
+            # existing document. Log cleanup failure without hiding the
+            # original ingestion failure.
+            logger.warning(
+                "Could not remove partial vectors for failed document %s (%s).",
+                document_id,
+                type(error).__name__,
+            )
 
-    document_id = str(uuid.uuid4())
-    document_path = DOCUMENT_DIR / f"{document_id}.pdf"
+
+def _record_ingestion_stage(
+    job_id: str,
+    document_id: str,
+    stage: str,
+    stage_status: str,
+    duration_ms: float,
+    error_code: str | None,
+) -> None:
+    ingestion_jobs.update_stage_timing(
+        job_id,
+        stage=stage,
+        status=stage_status,
+        duration_ms=duration_ms,
+        error_code=error_code,
+    )
+    logger.info(
+        "document_ingestion_stage job_id=%s document_id=%s stage=%s "
+        "status=%s duration_ms=%.1f error_code=%s",
+        job_id,
+        document_id,
+        stage,
+        stage_status,
+        duration_ms,
+        error_code or "-",
+    )
+
+
+def _safe_ingestion_failure(stage: str, error: Exception) -> tuple[str, str]:
+    if isinstance(error, NoRetrievableContentError):
+        return (
+            "no_retrievable_content",
+            "No retrievable text or content was extracted from this PDF.",
+        )
+    if isinstance(error, PDFProcessingError):
+        return (
+            "invalid_pdf",
+            "The file is not a valid PDF or has no readable pages. "
+            "Check the file and retry.",
+        )
+    if isinstance(error, OCRUnavailableError):
+        return "ocr_unavailable", "OCR is unavailable. Check TESSERACT_PATH and retry."
+    if isinstance(error, MaskingRejectedError):
+        return (
+            "masking_rejected",
+            "The document failed the masking safety validation.",
+        )
+    if isinstance(error, LLMError):
+        return error.code, str(error)
+    if stage == "graph_extraction":
+        return "graph_extraction_failed", "Knowledge graph extraction failed. Retry this job."
+    if stage == "neo4j_persistence":
+        return "graph_persistence_failed", "Knowledge graph persistence failed. Retry this job."
+    if stage == "embedding":
+        return "embedding_failed", "Document embedding failed. Retry this job."
+    if stage == "pinecone_indexing":
+        return "vector_indexing_failed", "Document indexing failed. Retry this job."
+    return (
+        f"{stage or 'ingestion'}_failed",
+        "Document processing failed at the reported stage. Retry this job.",
+    )
+
+
+def _execute_ingestion_job(job_id: str) -> None:
+    """Run the durable ingestion job; retries reuse stable document IDs."""
+    try:
+        job = ingestion_jobs.get_job(job_id)
+    except Exception as error:
+        logger.error(
+            "Could not load ingestion job job_id=%s error_code=%s",
+            job_id,
+            type(error).__name__,
+        )
+        return
+    if job is None or job.status == "completed":
+        return
+
+    document_id = job.document_id
+    document_path = Path(job.file_path)
+    current_stage = "queued"
+    ingestion_started = time.perf_counter()
+    attempt = job.attempts + 1
+
+    def stage_callback(
+        stage: str,
+        status: str,
+        duration_ms: float,
+        error_code: str | None,
+    ) -> None:
+        nonlocal current_stage
+        current_stage = stage
+        _record_ingestion_stage(
+            job_id,
+            document_id,
+            stage,
+            status,
+            duration_ms,
+            error_code,
+        )
 
     try:
-        file_bytes = await _read_upload_bytes(file)
-
-        if not file_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded file is empty.",
-            )
-
-        # A renamed non-PDF must not reach the PDF parsers.
-        if not file_bytes.startswith(PDF_SIGNATURE):
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded file is not a valid PDF.",
-            )
-
-        document_path.write_bytes(file_bytes)
-
-        # This function performs text extraction, OCR,
-        # table/image extraction, embedding, and indexing.
-        # When apply_masking is set, extracted text is masked and
-        # re-validated before embedding; image extraction is skipped.
-        (
-            content_units,
-            ocr_pages,
-            table_units,
-            image_units,
-            masking_stats,
-        ) = process_document(
-            document_path=document_path,
-            document_id=document_id,
-            apply_masking=apply_masking,
+        ingestion_jobs.update_job(
+            job_id,
+            status="processing",
+            stage="upload_validation",
+            attempts=attempt,
+            error_code=None,
+            error_message=None,
         )
+        logger.info(
+            "document_ingestion_started job_id=%s document_id=%s attempt=%s",
+            job_id,
+            document_id,
+            attempt,
+        )
+        if not document_path.is_file():
+            raise FileNotFoundError("Persisted PDF is unavailable.")
 
+        content_units, ocr_pages, table_units, image_units, masking_stats = (
+            process_document(
+                document_path=document_path,
+                document_id=document_id,
+                apply_masking=bool(job.mask_content),
+                on_stage=stage_callback,
+            )
+        )
         if not content_units:
-            # Nothing retrievable was indexed, so do not leave the raw
-            # upload or any extracted images behind.
-            _remove_upload_artifacts(document_id, document_path)
-
-            raise HTTPException(
-                status_code=422,
-                detail="No retrievable content was extracted from this PDF.",
+            raise NoRetrievableContentError(
+                "No retrievable content was extracted from this PDF."
             )
 
-        # Knowledge-graph ingestion is best-effort: a Neo4j outage must
-        # not fail the upload, but it is reported honestly in the
-        # response (and logged) instead of being silently ignored.
+        text_units = [
+            unit
+            for unit in content_units
+            if unit.get("content_type") in {"text", "table"}
+            and unit.get("content", "").strip()
+        ]
         graph_result: dict | None = None
         graph_error: str | None = None
-
-        if graph_service.is_configured():
-            try:
-                text_for_graph = "\n".join(
-                    unit.get("content", "")
-                    for unit in content_units
-                    if unit.get("content_type") in {"text", "table"}
-                    and unit.get("content", "").strip()
-                )
-
-                if text_for_graph.strip():
-                    graph_result = ingest_document_graph(
-                        document_id=document_id,
-                        title=file.filename,
-                        content=text_for_graph,
-                    )
-
-            except Exception as error:
-                graph_error = f"{type(error).__name__}: {error}"
-                logger.warning(
-                    "Graph ingestion failed for document %s: %s",
-                    document_id,
-                    graph_error,
-                )
-        else:
-            graph_error = (
-                "Neo4j is not configured; graph ingestion skipped."
+        if graph_service.is_configured() and text_units:
+            text_for_graph = "\n".join(
+                unit.get("content", "") for unit in text_units
+            )
+            graph_pages = [
+                {
+                    "page_number": unit.get("page_number"),
+                    "source_unit_id": unit.get("id"),
+                    "content": unit.get("content", ""),
+                }
+                for unit in text_units
+            ]
+            graph_result = ingest_document_graph(
+                document_id=document_id,
+                title=job.filename,
+                content=text_for_graph,
+                pages=graph_pages,
+                on_stage=stage_callback,
+            )
+        elif not graph_service.is_configured():
+            graph_error = "Neo4j is not configured; graph ingestion skipped."
+            stage_callback(
+                "knowledge_graph",
+                "skipped",
+                0.0,
+                "neo4j_not_configured",
             )
 
-        # Masked documents are never kept as raw files on disk: only
-        # the sanitized content units were embedded and indexed. The
-        # sanitized full text is retained so `summarise this` can still
-        # use the full-text fallback without the raw PDF.
         masked_text_stored = False
-
         if masking_stats["applied"]:
+            artifact_started = time.perf_counter()
             try:
                 masked_text_stored = (
-                    write_masked_text_artifact(
-                        document_id,
-                        content_units,
-                    )
+                    write_masked_text_artifact(document_id, content_units)
                     is not None
                 )
             except OSError as error:
-                # Indexing already succeeded; a missing fallback artifact
-                # must not turn a successful upload into an error.
-                logger.warning(
-                    "Could not store masked full text for %s: %s",
-                    document_id,
-                    error,
+                stage_callback(
+                    "masked_text_artifact",
+                    "failed",
+                    (time.perf_counter() - artifact_started) * 1000,
+                    type(error).__name__,
                 )
+                raise
+            else:
+                stage_callback(
+                    "masked_text_artifact",
+                    "completed",
+                    (time.perf_counter() - artifact_started) * 1000,
+                    None,
+                )
+            if document_path.exists():
+                document_path.unlink()
 
-        if masking_stats["applied"] and document_path.exists():
-            document_path.unlink()
-
-        return {
-            "message": (
-                "Document processed successfully. Masked content was "
-                "indexed and the raw PDF was not stored."
-                if masking_stats["applied"]
-                else "Document processed successfully."
-            ),
-            "document_id": document_id,
-            "filename": file.filename,
+        result = {
             "content_units": len(content_units),
             "ocr_pages": ocr_pages,
             "tables_extracted": len(table_units),
@@ -1055,6 +1293,15 @@ async def upload_document(
             "masking_applied": masking_stats["applied"],
             "masking_safety_passed": masking_stats["safety_passed"],
             "masked_entities": masking_stats["masked_entities"],
+            "newly_masked_entities": masking_stats.get(
+                "masked_entities", 0
+            ),
+            "existing_placeholders": masking_stats.get(
+                "existing_placeholders", 0
+            ),
+            "existing_placeholder_occurrences": masking_stats.get(
+                "existing_placeholder_occurrences", 0
+            ),
             "masked_text_stored": masked_text_stored,
             "knowledge_graph": {
                 "ingested": graph_result is not None,
@@ -1071,71 +1318,309 @@ async def upload_document(
                 "error": graph_error,
             },
         }
-
-    except HTTPException:
-        raise
-
-    except PDFProcessingError as error:
-        # Empty, truncated, or unopenable PDFs are client errors. The
-        # message is produced by our extractor and contains no parser
-        # internals or filesystem paths.
-        _remove_upload_artifacts(document_id, document_path)
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        ) from error
-
-    except MaskingRejectedError as error:
-        # Fail closed: nothing was embedded or indexed. Remove every
-        # artifact so no raw sensitive content remains on disk.
-        _remove_upload_artifacts(document_id, document_path)
-
-        raise HTTPException(
-            status_code=422,
-            detail=str(error),
-        ) from error
-
-    except OCRUnavailableError as error:
-        # The scanned-page fallback cannot run without the Tesseract
-        # binary. The message is ours: it names the environment
-        # variable and configured path, and contains no internals.
-        _remove_upload_artifacts(document_id, document_path)
-
-        logger.error(
-            "Upload rejected for %s: %s", document_id, error
+        stage_callback(
+            "completion",
+            "completed",
+            (time.perf_counter() - ingestion_started) * 1000,
+            None,
         )
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(error),
-        ) from error
-
-    except Exception as error:
-        # Remove the uploaded PDF (and any extracted images) if
-        # processing fails, so a failed stage never leaves content on
-        # disk. The full traceback is logged server-side (document id and
-        # exception type only) and never returned to the client: it can
-        # contain parser details, file paths, or connection information.
-        # No document text, PII, or credential is logged here.
-        _remove_upload_artifacts(document_id, document_path)
-
-        logger.exception(
-            "Document processing failed for %s (%s)",
+        ingestion_jobs.update_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            result=result,
+            error_code=None,
+            error_message=None,
+        )
+        logger.info(
+            "document_ingestion_completed job_id=%s document_id=%s "
+            "duration_ms=%.1f content_units=%s graph_ingested=%s",
+            job_id,
             document_id,
+            (time.perf_counter() - ingestion_started) * 1000,
+            len(content_units),
+            graph_result is not None,
+        )
+    except Exception as error:
+        error_code, error_message = _safe_ingestion_failure(
+            current_stage,
+            error,
+        )
+        if isinstance(
+            error,
+            (PDFProcessingError, MaskingRejectedError),
+        ):
+            try:
+                document_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                logger.warning(
+                    "Could not remove rejected upload job_id=%s "
+                    "error_code=%s",
+                    job_id,
+                    type(cleanup_error).__name__,
+                )
+            try:
+                delete_stored_document_files(document_id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not remove rejected document artifacts "
+                    "document_id=%s error_code=%s",
+                    document_id,
+                    type(cleanup_error).__name__,
+                )
+        try:
+            ingestion_jobs.update_job(
+                job_id,
+                status="failed",
+                stage=current_stage,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        except Exception as status_error:
+            logger.error(
+                "Could not persist ingestion failure job_id=%s "
+                "error_code=%s",
+                job_id,
+                type(status_error).__name__,
+            )
+            return
+        logger.error(
+            "document_ingestion_failed job_id=%s document_id=%s "
+            "stage=%s error_code=%s exception_type=%s duration_ms=%.1f",
+            job_id,
+            document_id,
+            current_stage,
+            error_code,
             type(error).__name__,
+            (time.perf_counter() - ingestion_started) * 1000,
         )
 
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Document processing failed unexpectedly. "
-                "No content was indexed."
-            ),
-        ) from None
 
+def _schedule_ingestion_job(job_id: str) -> bool:
+    with _SCHEDULED_INGESTION_LOCK:
+        if job_id in _SCHEDULED_INGESTION_JOBS:
+            return False
+        _SCHEDULED_INGESTION_JOBS.add(job_id)
+
+    def run_and_release() -> None:
+        try:
+            _execute_ingestion_job(job_id)
+        finally:
+            with _SCHEDULED_INGESTION_LOCK:
+                _SCHEDULED_INGESTION_JOBS.discard(job_id)
+
+    try:
+        _INGESTION_EXECUTOR.submit(run_and_release)
+    except Exception:
+        with _SCHEDULED_INGESTION_LOCK:
+            _SCHEDULED_INGESTION_JOBS.discard(job_id)
+        raise
+    return True
+
+
+@app.post("/documents/upload", status_code=202)
+async def upload_document(
+    file: UploadFile = File(...),
+    # Optional multipart field; when "true", extracted text (including
+    # OCR output) is masked and re-validated BEFORE embedding/indexing.
+    mask_content: str = Form(default="false"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=200,
+    ),
+):
+    started = time.perf_counter()
+    try:
+        if (
+            not file.filename
+            or Path(file.filename).suffix.lower() != ".pdf"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Please upload a PDF file.",
+            )
+        apply_masking = _parse_mask_flag(mask_content)
+        file_bytes = await _read_upload_bytes(file)
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty.",
+            )
+
+        # A renamed non-PDF must not reach the PDF parsers.
+        if not file_bytes.startswith(PDF_SIGNATURE):
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is not a valid PDF.",
+            )
+
+        validation_ms = (time.perf_counter() - started) * 1000
+        content_hash = hashlib.sha256(file_bytes).hexdigest()
+        key_source = (
+            f"client:{idempotency_key.strip()}:content:{content_hash}:"
+            f"mask={int(apply_masking)}"
+            if idempotency_key and idempotency_key.strip()
+            else f"request:{uuid.uuid4()}"
+        )
+        safe_idempotency_key = hashlib.sha256(
+            key_source.encode("utf-8")
+        ).hexdigest()
+        document_id = str(uuid.uuid4())
+        document_path = DOCUMENT_DIR / f"{document_id}.pdf"
+        try:
+            job, created = ingestion_jobs.create_or_get_job(
+                idempotency_key=safe_idempotency_key,
+                filename=Path(file.filename or "upload.pdf").name,
+                file_path=str(document_path),
+                mask_content=apply_masking,
+            )
+        except Exception as error:
+            logger.error(
+                "Ingestion job persistence failed error_code=%s",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Durable ingestion job storage is unavailable. "
+                    "Apply the database migrations and retry."
+                ),
+                headers={"X-Error-Code": "ingestion_job_store_unavailable"},
+            ) from error
+
+        if created:
+            persistence_started = time.perf_counter()
+            try:
+                document_path.write_bytes(file_bytes)
+                _record_ingestion_stage(
+                    job.id,
+                    job.document_id,
+                    "upload_validation",
+                    "completed",
+                    validation_ms,
+                    None,
+                )
+                _record_ingestion_stage(
+                    job.id,
+                    job.document_id,
+                    "upload_persistence",
+                    "completed",
+                    (time.perf_counter() - persistence_started) * 1000,
+                    None,
+                )
+            except Exception as error:
+                ingestion_jobs.update_job(
+                    job.id,
+                    status="failed",
+                    stage="upload_persistence",
+                    error_code="upload_persistence_failed",
+                    error_message="The uploaded PDF could not be stored.",
+                )
+                if document_path.exists():
+                    document_path.unlink()
+                raise HTTPException(
+                    status_code=500,
+                    detail="The uploaded PDF could not be stored.",
+                ) from error
+            try:
+                _schedule_ingestion_job(job.id)
+            except RuntimeError as error:
+                ingestion_jobs.update_job(
+                    job.id,
+                    status="failed",
+                    stage="queued",
+                    error_code="ingestion_worker_unavailable",
+                    error_message=(
+                        "The ingestion worker is unavailable. Retry this job."
+                    ),
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "The ingestion worker is unavailable. "
+                        "Retry the accepted job."
+                    ),
+                ) from error
+
+        payload = ingestion_jobs.job_response(job)
+        payload["status_url"] = f"/documents/jobs/{job.id}"
+        payload["duplicate_request"] = not created
+        return payload
     finally:
         await file.close()
+
+
+@app.get("/documents/jobs/{job_id}")
+def read_ingestion_job(job_id: str):
+    try:
+        normalized_id = str(uuid.UUID(job_id))
+        job = ingestion_jobs.get_job(normalized_id)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ingestion job ID.",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Ingestion job status is unavailable.",
+        ) from error
+    if job is None:
+        raise HTTPException(status_code=404, detail="Ingestion job not found.")
+    return ingestion_jobs.job_response(job)
+
+
+@app.post("/documents/jobs/{job_id}/retry", status_code=202)
+def retry_ingestion_job(job_id: str):
+    try:
+        normalized_id = str(uuid.UUID(job_id))
+        job = ingestion_jobs.get_job(normalized_id)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ingestion job ID.",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Ingestion job status is unavailable.",
+        ) from error
+    if job is None:
+        raise HTTPException(status_code=404, detail="Ingestion job not found.")
+    if job.status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail="Only failed ingestion jobs can be retried.",
+        )
+    if not Path(job.file_path).is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="The persisted PDF is unavailable; upload it again.",
+        )
+    ingestion_jobs.update_job(
+        job.id,
+        status="queued",
+        stage="queued",
+        error_code=None,
+        error_message=None,
+    )
+    try:
+        _schedule_ingestion_job(job.id)
+    except RuntimeError as error:
+        ingestion_jobs.update_job(
+            job.id,
+            status="failed",
+            stage="queued",
+            error_code="ingestion_worker_unavailable",
+            error_message="The ingestion worker is unavailable.",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The ingestion worker is unavailable. Retry this job.",
+        ) from error
+    refreshed = ingestion_jobs.get_job(job.id)
+    return ingestion_jobs.job_response(refreshed)
 
 
 # --------------------------------------------------
@@ -1236,6 +1721,28 @@ def ask_document(request: RAGRequest, db=Depends(get_db_optional)):
                 user_id=request.user_id,
             )
 
+            document_summary = (
+                target_document_id is not None
+                and is_summary_request(query)
+            )
+            if document_summary:
+                answer = _summarize_document_context(
+                    context,
+                    target_document_id,
+                )
+                return {
+                    "query": query,
+                    "answer": answer,
+                    "sources": {
+                        "conversation": None,
+                        "memory": [],
+                        "rag": context.get("rag", []),
+                        "knowledge_graph": [],
+                    },
+                    "source_errors": context.get("source_errors", []),
+                    "images_sent_to_llm": 0,
+                }
+
             if target_document_id is not None and not context.get("rag"):
                 raise HTTPException(
                     status_code=400,
@@ -1320,6 +1827,28 @@ def ask_document(request: RAGRequest, db=Depends(get_db_optional)):
             user_id=request.user_id,
         )
 
+        document_summary = (
+            target_document_id is not None
+            and is_summary_request(query)
+        )
+        if document_summary:
+            answer = _summarize_document_context(
+                context,
+                target_document_id,
+            )
+            return {
+                "query": query,
+                "answer": answer,
+                "sources": {
+                    "conversation": None,
+                    "memory": [],
+                    "rag": context.get("rag", []),
+                    "knowledge_graph": [],
+                },
+                "source_errors": context.get("source_errors", []),
+                "images_sent_to_llm": 0,
+            }
+
         # With no selected document and no retrievable evidence there is
         # nothing to ground an answer in. Report that instead of sending
         # a question-only prompt that invites a fabricated summary.
@@ -1375,10 +1904,7 @@ def ask_document(request: RAGRequest, db=Depends(get_db_optional)):
         raise
 
     except LLMError as error:
-        raise HTTPException(
-            status_code=503,
-            detail=str(error),
-        ) from error
+        raise _llm_http_exception(error) from error
 
     except Exception:
         # Log technical details on the server; do not expose internal
@@ -1457,6 +1983,8 @@ def preview_context(
             request.session_id,
         )
 
+    started_at = time.perf_counter()
+
     try:
         context = assemble_context(
             query=query,
@@ -1492,6 +2020,15 @@ def preview_context(
         if resolve_image_path(result):
             image_references += 1
 
+    assembly = build_context_report(context)
+    diagnostics = build_context_diagnostics(
+        context,
+        conversation_requested=conversation is not None,
+        memory_requested=bool(request.user_id),
+        duration_ms=int((time.perf_counter() - started_at) * 1000),
+        assembly=assembly,
+    )
+
     return {
         "query": query,
         "sources": {
@@ -1519,7 +2056,8 @@ def preview_context(
         # The assembled context text (before the built-in security
         # instructions are prepended), i.e. exactly the evidence an
         # answer would be based on.
-        "formatted_context": format_context(context),
+        "formatted_context": assembly["formatted_context"],
+        "diagnostics": diagnostics,
     }
 
 
@@ -2250,27 +2788,88 @@ def delete_memory_endpoint(
             ),
         )
 
-    return {"deleted": True, "memory_id": memory_id}
+    try:
+        remaining_memory_count = count_memories(db, user_id)
+    except SQLAlchemyError as error:
+        raise _database_error() from error
+
+    return {
+        "deleted": True,
+        "memory_id": memory_id,
+        "dry_run": False,
+        "other_memories_preserved": True,
+        "remaining_memory_count": remaining_memory_count,
+    }
 
 
 # --------------------------------------------------
 # Knowledge graph
 # --------------------------------------------------
 
+
+@app.get("/knowledge-graph/status")
+def read_knowledge_graph_status():
+    """Report graph reachability and aggregate counts without exposing config."""
+
+    if not graph_service.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Neo4j is not configured. Set NEO4J_URI and "
+                "NEO4J_PASSWORD in the root .env file."
+            ),
+        )
+
+    try:
+        verify_graph_connection()
+        counts = graph_counts()
+    except RuntimeError as error:
+        detail = str(error)
+        if "NEO4J_URI" not in detail:
+            detail = "Knowledge graph is unreachable."
+        raise HTTPException(status_code=503, detail=detail) from error
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge graph is unreachable.",
+        ) from None
+
+    return {"available": True, "counts": counts}
+
+
 @app.get("/knowledge-graph/entities")
 def read_knowledge_graph_entities(
     search: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    entity_type: str | None = Query(default=None, max_length=40),
 ):
-    """List graph entities, optionally filtered by name."""
+    """Read graph entities with optional search, type, and paging filters."""
 
     clean_search = search.strip() if search else ""
+    clean_entity_type = entity_type.strip() if entity_type else None
 
     try:
         if clean_search:
-            entities = find_entities(clean_search)
+            if offset:
+                entities = find_entities(
+                    clean_search,
+                    limit=limit,
+                    entity_type=clean_entity_type,
+                    offset=offset,
+                )
+            else:
+                entities = find_entities(
+                    clean_search,
+                    limit=limit,
+                    entity_type=clean_entity_type,
+                )
         else:
-            entities = list_entities(limit=limit)
+            entities = list_entities(
+                limit=limit,
+                offset=offset,
+                entity_type=clean_entity_type,
+            )
 
     except ValueError as error:
         raise HTTPException(
@@ -2296,6 +2895,80 @@ def read_knowledge_graph_entities(
         "entities": entities,
         "search": clean_search or None,
     }
+
+
+@app.get("/knowledge-graph/entities/{entity_id}/neighborhood")
+def read_entity_neighborhood(
+    entity_id: str,
+    limit: int = Query(default=25, ge=1, le=100),
+):
+    """Read an entity and its bounded incoming/outgoing graph edges."""
+
+    if not entity_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="entity_id cannot be empty.",
+        )
+
+    try:
+        neighborhood = get_entity_neighborhood(entity_id, limit=limit)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+    except Exception:
+        logger.exception("Knowledge graph neighborhood lookup failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge graph neighborhood lookup failed.",
+        ) from None
+
+    return {
+        "entity_id": entity_id,
+        "entity": neighborhood["entity"],
+        "edges": neighborhood["edges"],
+    }
+
+
+@app.get("/knowledge-graph/entities/{entity_id}/documents")
+def read_entity_documents(
+    entity_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+):
+    """Read documents linked to an entity through MENTIONS edges."""
+
+    if not entity_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="entity_id cannot be empty.",
+        )
+
+    try:
+        documents = find_entity_documents(entity_id, limit=limit)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+    except Exception:
+        logger.exception("Knowledge graph entity-document lookup failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge graph entity-document lookup failed.",
+        ) from None
+
+    return {"entity_id": entity_id, "documents": documents}
 
 
 @app.get(
@@ -2463,6 +3136,38 @@ def run_graph_cleanup(request: GraphCleanupRequest):
         )
 
     return result
+
+
+@app.get("/knowledge-graph/documents/{document_id}/graph")
+def read_graph_document_graph(document_id: str):
+    """Return one document's entities and the relationships between them."""
+
+    try:
+        graph = find_document_graph(document_id)
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+
+    except Exception:
+        logger.exception("Knowledge graph document graph lookup failed")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Knowledge graph document graph lookup failed "
+                "unexpectedly."
+            ),
+        ) from None
+
+    return graph
 
 
 @app.get("/knowledge-graph/documents/{document_id}/entities")

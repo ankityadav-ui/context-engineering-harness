@@ -22,11 +22,11 @@ from app.system_prompt import SECURITY_INSTRUCTIONS
 
 
 class FakeProvider:
-    """Minimal in-memory Ollama chat double that records prompts."""
+    """Minimal in-memory Gemini chat double that records prompts."""
 
     def __init__(self, response="llm answer"):
         self.response = response
-        self.seen_messages: list[list[dict]] = []
+        self.seen_messages = []
 
     def _response(self, content):
         response = type("ChatResponse", (), {})()
@@ -34,35 +34,35 @@ class FakeProvider:
         response.message.content = content
         return response
 
-    def chat(self, **kwargs):
-        self.seen_messages.append(kwargs.get("messages", []))
+    def invoke(self, messages):
+        self.seen_messages.append(messages)
+        return type("AIMessage", (), {"content": self.response})()
 
-        if kwargs.get("stream"):
-            return iter([self._response(self.response)])
-
-        return self._response(self.response)
+    def stream(self, messages):
+        self.seen_messages.append(messages)
+        yield type("AIMessageChunk", (), {"content": self.response})()
 
     @property
     def last_user_text(self):
         return "".join(
-            message.get("content", "")
+            message.content
             for message in self.seen_messages[-1]
-            if message.get("role") == "user"
+            if message.type == "human"
         )
 
     @property
     def last_system_text(self):
         return "".join(
-            message.get("content", "")
+            message.content
             for message in self.seen_messages[-1]
-            if message.get("role") == "system"
+            if message.type == "system"
         )
 
 
 @pytest.fixture()
 def fake_llm(monkeypatch):
     provider = FakeProvider()
-    monkeypatch.setattr(llm_module, "_get_client", lambda: provider)
+    monkeypatch.setattr(llm_module, "get_chat_model", lambda: provider)
     llm_module.reset_client()
     return provider
 

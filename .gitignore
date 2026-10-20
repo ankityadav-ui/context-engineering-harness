@@ -26,3 +26,13 @@ backend/storage/settings/
 # Python test caches
 .pytest_cache/
 .coverage
+.coverage.*
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+build/
+*.egg-info/
+
+# Streamlit agent skills (environment-specific symlinks)
+.agents/skills/developing-with-streamlit
+.claude/skills/developing-with-streamlit

@@ -1,7 +1,7 @@
 """Tests for persistent chat conversations (POST /chat and /chat/stream).
 
 Storage is the shared in-memory SQLite database from conftest, and the
-Ollama client is replaced with an in-memory double, so no PostgreSQL
+Gemini client is replaced with an in-memory double, so no PostgreSQL
 server, Pinecone index, Neo4j instance, or LLM is contacted.
 
 Covered here:
@@ -37,12 +37,12 @@ from app.context_engine.conversation_service import (
 
 
 class FakeProvider:
-    """Minimal in-memory Ollama chat double (text responses)."""
+    """Minimal in-memory Gemini chat double (text responses)."""
 
     def __init__(self, response="stored reply", fail=False):
         self.response = response
         self.fail = fail
-        self.seen_messages: list[list[dict]] = []
+        self.seen_messages = []
 
     def _response(self, content):
         response = type("ChatResponse", (), {})()
@@ -50,24 +50,26 @@ class FakeProvider:
         response.message.content = content
         return response
 
-    def chat(self, **kwargs):
-        messages = kwargs.get("messages", [])
+    def invoke(self, messages):
         self.seen_messages.append(messages)
 
         if self.fail:
             raise RuntimeError("upstream exploded")
 
-        if kwargs.get("stream"):
-            return iter([self._response(self.response)])
+        return type("AIMessage", (), {"content": self.response})()
 
-        return self._response(self.response)
+    def stream(self, messages):
+        self.seen_messages.append(messages)
+        if self.fail:
+            raise RuntimeError("upstream exploded")
+        yield type("AIMessageChunk", (), {"content": self.response})()
 
     @property
     def last_user_text(self):
         return "".join(
-            message.get("content", "")
+            message.content
             for message in self.seen_messages[-1]
-            if message.get("role") == "user"
+            if message.type == "human"
         )
 
 
@@ -75,7 +77,7 @@ class FakeProvider:
 def fake_llm(monkeypatch):
     def install(response="stored reply", fail=False):
         provider = FakeProvider(response=response, fail=fail)
-        monkeypatch.setattr(llm_module, "_get_client", lambda: provider)
+        monkeypatch.setattr(llm_module, "get_chat_model", lambda: provider)
         llm_module.reset_client()
         return provider
 
@@ -243,6 +245,7 @@ def test_older_messages_are_summarized_and_latest_six_stay_recent(
 def test_context_preview_reflects_persisted_history(
     api_client, fake_llm, isolated_assembly
 ):
+    fake_llm()
     created = api_client.post("/conversations", json={}).json()
 
     api_client.post(
@@ -488,7 +491,8 @@ def test_malformed_conversation_id_returns_404(api_client):
     assert response.status_code == 404
 
 
-def test_session_ownership_isolates_conversations(api_client):
+def test_session_ownership_isolates_conversations(api_client, fake_llm):
+    fake_llm()
     created = api_client.post(
         "/conversations",
         json={"title": "Private", "session_id": "session-a"},

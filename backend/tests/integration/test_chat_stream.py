@@ -1,7 +1,7 @@
 """Tests for POST /chat/stream (server-sent event streaming).
 
-The active Ollama client is replaced with an in-memory double, so no
-Ollama server, no cloud endpoint, and no paid API is ever contacted.
+The active Gemini model is replaced with an in-memory double, so no
+external provider is ever contacted.
 
 Covered here:
 - multiple chunks arriving progressively over the wire,
@@ -27,12 +27,9 @@ from app.system_prompt import SECURITY_INSTRUCTIONS
 
 
 class FakeStreamProvider:
-    """In-memory Ollama chat client double.
+    """In-memory Gemini chat model double.
 
-    Mirrors the real SDK contract: ``chat()`` returns one object whose
-    ``message.content`` holds the text, and with ``stream=True`` returns
-    an iterable of those objects. Every call records the full ``messages``
-    list so tests can inspect the system and user roles separately.
+    Mirrors LangChain's ``invoke()`` and ``stream()`` message contracts.
     """
 
     def __init__(self, chunks, model="fake-model", fail_after=None):
@@ -43,17 +40,14 @@ class FakeStreamProvider:
         self.seen_messages: list[list[dict]] = []
         self.closed = False
 
-    @staticmethod
-    def _response(content):
-        response = type("ChatResponse", (), {})()
-        response.message = type("Message", (), {})()
-        response.message.content = content
-        return response
-
-    def generate_text(self, message):
+    def generate_text(self):
         return "".join(
             chunk for chunk in self.chunks if isinstance(chunk, str)
         )
+
+    def stream(self, messages):
+        self.seen_messages.append(messages)
+        return self._stream()
 
     def _stream(self):
         try:
@@ -61,22 +55,17 @@ class FakeStreamProvider:
                 if self.fail_after is not None and index == self.fail_after:
                     raise RuntimeError("upstream exploded")
 
-                yield self._response(chunk)
+                yield type("AIMessageChunk", (), {"content": chunk})()
         finally:
-            # Mirrors the real SDK: runs on completion, failure, and
-            # client cancellation (GeneratorExit).
             self.closed = True
 
-    def chat(self, **kwargs):
-        messages = kwargs.get("messages", [])
+    def invoke(self, messages):
         self.seen_messages.append(messages)
-
-        if kwargs.get("stream"):
-            return self._stream()
-
-        return self._response(
-            self.generate_text(messages[-1].get("content", ""))
-        )
+        return type(
+            "AIMessage",
+            (),
+            {"content": self.generate_text()},
+        )()
 
     # -- assertions helpers -------------------------------------------
 
@@ -87,25 +76,26 @@ class FakeStreamProvider:
     @property
     def last_system_text(self):
         return "".join(
-            message.get("content", "")
+            message.content
             for message in self.last_messages
-            if message.get("role") == "system"
+            if message.type == "system"
         )
 
     @property
     def last_user_text(self):
         return "".join(
-            message.get("content", "")
+            message.content
             for message in self.last_messages
-            if message.get("role") == "user"
+            if message.type == "human"
         )
 
 
 @pytest.fixture(autouse=True)
 def isolated_settings(monkeypatch):
-    """Keep tests independent from the local Ollama environment."""
+    """Keep tests independent from local provider configuration."""
 
-    monkeypatch.delenv("OLLAMA_VISION_MODEL", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_TEXT_MODEL", "gemini-test-model")
 
 
 @pytest.fixture()
@@ -114,7 +104,7 @@ def fake_provider(monkeypatch):
 
     def install(chunks, **kwargs):
         provider = FakeStreamProvider(chunks, **kwargs)
-        monkeypatch.setattr(llm_module, "_get_client", lambda: provider)
+        monkeypatch.setattr(llm_module, "get_chat_model", lambda: provider)
         llm_module.reset_client()
         return provider
 
@@ -201,9 +191,9 @@ def test_stream_done_reports_assembled_response_and_provider(
     assert len(done) == 1
 
     # The assembled response equals the concatenation of the deltas, and
-    # the event reports the Ollama backend that served this stream.
+    # the event reports the Gemini backend that served this stream.
     assert done[0]["response"] == "ABC"
-    assert done[0]["provider"] == "ollama"
+    assert done[0]["provider"] == "gemini"
     assert done[0]["model"] == llm_module.get_text_model()
     assert done[0]["system_prompt_active"] is False
 
@@ -302,26 +292,11 @@ def test_stream_provider_without_streaming_support_reports_error(
     class NonStreamingProvider:
         model = "no-stream"
 
-        def chat(self, **kwargs):
-            if kwargs.get("stream"):
-                raise TypeError("streaming not supported")
-
-            response = type("ChatResponse", (), {})()
-            response.message = type("Message", (), {})()
-            response.message.content = "should not be used"
-            return response
-
-        def list(self):
-            return [type("Model", (), {"name": "models/gemma4:31b"})()]
-
-        def show(self, model=None):
-            return type("Show", (), {"capabilities": []})()
-
-        def close(self):
-            pass
+        def stream(self, _messages):
+            raise TypeError("streaming not supported")
 
     monkeypatch.setattr(
-        llm_module, "_get_client", lambda: NonStreamingProvider()
+        llm_module, "get_chat_model", lambda: NonStreamingProvider()
     )
 
     events = stream_events(api_client, "Hi")

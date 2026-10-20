@@ -184,7 +184,13 @@ def test_context_preview_distinguishes_rag_error_from_empty_rag(
     # A failed source is empty AND explicitly reported as an error.
     assert body["sources"]["rag"] == []
     assert body["source_errors"] == [
-        {"source": "rag", "error": "vector store unavailable"}
+        {
+            "source": "rag",
+            "error": (
+                "Document retrieval failed. "
+                "The vector index may be unavailable."
+            ),
+        }
     ]
 
     # The preview still contains the question, not fabricated evidence.
@@ -223,7 +229,7 @@ def test_context_preview_distinguishes_conversation_error_from_empty(
     assert body["source_errors"] == [
         {
             "source": "conversation",
-            "error": "conversation storage unavailable",
+            "error": "Conversation context could not be read.",
         }
     ]
 

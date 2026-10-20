@@ -1,10 +1,12 @@
 
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError
 from PIL import Image
 
 # Formats the vision path supports. Kept in sync with
@@ -76,6 +78,19 @@ def __getattr__(name):
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 1024
 
+# Gemini accepts several inputs per embedding request. Sending one request
+# per content unit made a large PDF (hundreds of pages, images, and
+# tables) spend minutes in sequential round trips and trip the per-minute
+# rate limit, which surfaced as a generic upload failure. Batches keep a
+# whole document to a handful of requests.
+EMBEDDING_BATCH_SIZE = 50
+EMBEDDING_MAX_ATTEMPTS = 3
+
+# Transient upstream failures worth retrying: rate limiting and the
+# server-side 5xx family. Anything else (bad key, bad model, invalid
+# input) is not retried.
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
 # How much of the surrounding page context is embedded with an image.
 MAX_IMAGE_CONTEXT_CHARS = 800
 
@@ -87,36 +102,101 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 # Generate embeddings
 # --------------------------------------------------
 
-def generate_embedding(text: str) -> list[float]:
+def _is_retryable(error: Exception) -> bool:
+    """Report whether an embedding request failure is worth retrying."""
+
+    return (
+        getattr(error, "code", None) in RETRYABLE_STATUS_CODES
+        or isinstance(error, ServerError)
+    )
+
+
+def _embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed one batch, retrying transient upstream failures."""
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, EMBEDDING_MAX_ATTEMPTS + 1):
+        try:
+            response = get_client().models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=list(texts),
+                config=types.EmbedContentConfig(
+                    output_dimensionality=EMBEDDING_DIMENSION
+                ),
+            )
+            break
+
+        except Exception as error:
+            last_error = error
+
+            if attempt >= EMBEDDING_MAX_ATTEMPTS or not _is_retryable(error):
+                raise
+
+            # Exponential backoff: 2s, 4s. The per-page ingestion
+            # timeout is minutes, so a short wait is preferable to
+            # failing a whole document on a rate-limit spike.
+            time.sleep(2 ** attempt)
+
+    else:  # pragma: no cover - the loop either breaks or raises
+        raise RuntimeError(
+            "Gemini embedding request failed."
+        ) from last_error
+
+    embeddings = response.embeddings or []
+
+    if len(embeddings) != len(texts):
+        raise RuntimeError(
+            "Gemini returned "
+            f"{len(embeddings)} embeddings for {len(texts)} inputs."
+        )
+
+    values: list[list[float]] = []
+
+    for embedding in embeddings:
+        vector = embedding.values
+
+        if vector is None or len(vector) != EMBEDDING_DIMENSION:
+            raise RuntimeError(
+                "Gemini returned an embedding with an unexpected dimension."
+            )
+
+        values.append(list(vector))
+
+    return values
+
+
+def generate_embeddings(texts: list[str]) -> list[list[float]]:
     """
-    Generate a 1024-dimensional Gemini embedding.
+    Generate 1024-dimensional Gemini embeddings for several texts.
+
+    Texts are sent in batches and the returned vectors keep the input
+    order, so callers can zip them back onto their content units.
     """
-    if not text or not text.strip():
+
+    texts = list(texts)
+
+    if any(not text or not text.strip() for text in texts):
         raise ValueError(
             "Cannot generate an embedding for empty text."
         )
 
-    response = get_client().models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=text,
-        config=types.EmbedContentConfig(
-            output_dimensionality=EMBEDDING_DIMENSION
-        ),
-    )
+    embeddings: list[list[float]] = []
 
-    if not response.embeddings:
-        raise RuntimeError(
-            "Gemini returned no embedding."
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        embeddings.extend(
+            _embed_batch(texts[start:start + EMBEDDING_BATCH_SIZE])
         )
 
-    values = response.embeddings[0].values
+    return embeddings
 
-    if values is None or len(values) != EMBEDDING_DIMENSION:
-        raise RuntimeError(
-            "Gemini returned an embedding with an unexpected dimension."
-        )
 
-    return list(values)
+def generate_embedding(text: str) -> list[float]:
+    """
+    Generate a 1024-dimensional Gemini embedding for one text.
+    """
+
+    return generate_embeddings([text])[0]
 
 
 def generate_text_embedding(text: str) -> list[float]:
@@ -209,21 +289,30 @@ def embed_content_units(
     Generate embeddings for content units while preserving
     their original metadata and content references.
     """
-    embedded_units = []
+    if not content_units:
+        return []
 
-    for content_unit in content_units:
-        embedding_text = get_embedding_text(content_unit)
-        embedding = generate_embedding(embedding_text)
+    # Resolve every embedding input first (this validates content), then
+    # embed in batches instead of one request per unit.
+    embedding_texts = [
+        get_embedding_text(content_unit)
+        for content_unit in content_units
+    ]
 
-        embedded_unit = {
+    embeddings = generate_embeddings(embedding_texts)
+
+    return [
+        {
             **content_unit,
             "embedding": embedding,
             "embedding_text": embedding_text,
         }
-
-        embedded_units.append(embedded_unit)
-
-    return embedded_units
+        for content_unit, embedding, embedding_text in zip(
+            content_units,
+            embeddings,
+            embedding_texts,
+        )
+    ]
 
 
 # --------------------------------------------------

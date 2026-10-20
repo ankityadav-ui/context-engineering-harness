@@ -216,7 +216,13 @@ def test_a_failing_source_does_not_hide_the_others(monkeypatch, quiet_sources):
     assert context["rag"] == []
     assert context["memory"]
     assert context["source_errors"] == [
-        {"source": "rag", "error": "Pinecone is not configured."}
+        {
+            "source": "rag",
+            "error": (
+                "Document retrieval failed. "
+                "The vector index may be unavailable."
+            ),
+        }
     ]
 
 

@@ -26,6 +26,10 @@ PINECONE_NAMESPACE = "multimodal-v2"
 # Bound how much of the namespace a single document listing reads, so the
 # endpoint stays predictable even on a large index.
 MAX_DOCUMENT_SCAN_VECTORS = 1000
+
+# Maximum vectors sent in one Pinecone upsert request. 100 vectors of
+# 1024 float32 values plus metadata stay well under the 2 MB request cap.
+UPSERT_BATCH_SIZE = 100
 DOCUMENT_FETCH_BATCH_SIZE = 100
 
 # Bound how many content units one document lookup or delete reads.
@@ -206,6 +210,9 @@ def upsert_content_units(
                 "unknown",
             ),
         }
+        for key in ("page_count", "pages_without_text"):
+            if key in unit["metadata"]:
+                metadata[key] = unit["metadata"][key]
 
         if unit["content_type"] == "table":
             metadata["table_number"] = (
@@ -246,10 +253,15 @@ def upsert_content_units(
     if not vectors:
         return 0
 
-    get_index().upsert(
-        vectors=vectors,
-        namespace=PINECONE_NAMESPACE,
-    )
+    # Pinecone caps an upsert request by size (2 MB on serverless). A
+    # large PDF produces hundreds of 1024-dimension vectors, so sending
+    # them in one request was rejected by the API and surfaced as a
+    # generic upload failure. Batches keep each request small.
+    for start in range(0, len(vectors), UPSERT_BATCH_SIZE):
+        get_index().upsert(
+            vectors=vectors[start:start + UPSERT_BATCH_SIZE],
+            namespace=PINECONE_NAMESPACE,
+        )
 
     return len(vectors)
 
@@ -535,6 +547,107 @@ def get_document_content_units(
         "content_units": len(units),
         "units": units,
         "units_truncated": units_truncated,
+    }
+
+
+def get_document_searchable_units(
+    document_id: str,
+    max_units: int = MAX_DOCUMENT_UNITS,
+) -> dict:
+    """Read text-bearing indexed units for exactly one document.
+
+    Unlike semantic search, this returns the complete bounded source set
+    with its original unit id, page, and document metadata. It is intended
+    for grounded whole-document summaries, not user-facing document detail.
+    """
+
+    document_id = _validate_document_id(document_id)
+    index = get_index()
+    filter_expression = {"document_id": {"$eq": document_id}}
+    units: list[dict] = []
+    seen_unit_ids: set[str] = set()
+    pages_without_text: list[int] = []
+    page_count = None
+    document_found = False
+    pagination_token = None
+    truncated = False
+
+    while True:
+        page = index.fetch_by_metadata(
+            filter=filter_expression,
+            namespace=PINECONE_NAMESPACE,
+            limit=DOCUMENT_UNIT_PAGE_SIZE,
+            pagination_token=pagination_token,
+        )
+        for vector in page.vectors.values():
+            metadata = vector.metadata or {}
+            if str(metadata.get("document_id") or "") != document_id:
+                continue
+            document_found = True
+
+            if page_count is None:
+                candidate_page_count = metadata.get("page_count")
+                if isinstance(candidate_page_count, int):
+                    page_count = candidate_page_count
+                candidate_missing_pages = metadata.get(
+                    "pages_without_text"
+                )
+                if isinstance(candidate_missing_pages, list):
+                    pages_without_text = [
+                        page_number
+                        for page_number in candidate_missing_pages
+                        if isinstance(page_number, int)
+                    ]
+
+            if metadata.get("content_type") not in {"text", "table"}:
+                continue
+            content = metadata.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+
+            unit_id = str(vector.id)
+            if unit_id in seen_unit_ids:
+                continue
+
+            if len(units) >= max_units:
+                truncated = True
+                break
+
+            seen_unit_ids.add(unit_id)
+            units.append(
+                {
+                    "unit_id": unit_id,
+                    "document_id": document_id,
+                    "content_type": metadata["content_type"],
+                    "page_number": metadata.get("page_number"),
+                    "content": content,
+                    "source": metadata.get("source", "unknown"),
+                }
+            )
+
+        if truncated:
+            break
+        pagination = page.pagination
+        pagination_token = (
+            pagination.next if pagination is not None else None
+        )
+        if not pagination_token:
+            break
+
+    units.sort(
+        key=lambda unit: (
+            unit["page_number"] is None,
+            unit["page_number"] or 0,
+            unit["unit_id"],
+        )
+    )
+    return {
+        "document_id": document_id,
+        "document_found": document_found,
+        "units": units,
+        "page_count": page_count,
+        "pages_without_text": sorted(set(pages_without_text)),
+        "units_truncated": truncated,
     }
 
 

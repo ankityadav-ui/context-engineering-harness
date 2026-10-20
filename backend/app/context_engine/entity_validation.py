@@ -16,10 +16,10 @@ Two independent checks are applied here:
    organizational designators), not a list of document-specific
    exceptions.
 
-:func:`resolve_entity_types` adds deterministic document-level evidence:
-when the same name is labelled more than once with different types (the
-classic "Nagpur is GPE and PERSON" case), one type is chosen instead of
-creating duplicate nodes.
+:func:`resolve_entity_types` adds deterministic document-level evidence for
+the explicit legacy spaCy path. The LLM graph path uses the shared name and
+type-plausibility checks but drops names with conflicting types rather than
+choosing a label without enough context.
 
 None of these rules inspect or modify masking output.
 """
@@ -134,6 +134,9 @@ _ALLOWED_NAME_CHARACTERS = re.compile(
     r"[\w\s.'’&(),-]+",
     flags=re.UNICODE,
 )
+_HYPHENATED_MODEL_TOKEN = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*-\d+[A-Za-z]?"
+)
 
 # Characters left behind by masking or OCR that never belong in a name.
 _REJECTED_CHARACTERS = "[]<>\\®�"
@@ -183,7 +186,11 @@ def entity_name_key(name: str) -> str:
     return entity_comparison_key(name)
 
 
-def is_usable_entity_name(name: str) -> bool:
+def is_usable_entity_name(
+    name: str,
+    *,
+    allow_hyphenated_model_tokens: bool = False,
+) -> bool:
     """Return True when the span is a plausible entity name.
 
     This is name-quality validation only; it says nothing about whether
@@ -232,12 +239,17 @@ def is_usable_entity_name(name: str) -> bool:
         if token in {"&", "+"}:
             continue
 
-        has_digit = any(character.isdigit() for character in token)
+        token_name = token.strip(".,;:!?()")
+        has_digit = any(character.isdigit() for character in token_name)
         has_letter = any(character.isalpha() for character in token)
 
         # Tokens mixing digits and letters, e.g. "0nd".
         if has_digit and has_letter:
-            return False
+            if not (
+                allow_hyphenated_model_tokens
+                and _HYPHENATED_MODEL_TOKEN.fullmatch(token_name)
+            ):
+                return False
 
         if not has_letter:
             return False

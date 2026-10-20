@@ -46,7 +46,16 @@ class FakeSession:
                 "source": parameters.get("source"),
             }])
 
+        if "merge (entity:entity" in query_lower:
+            return FakeResult([{
+                "entity_id": parameters.get("entity_id"),
+                "entity_type": parameters.get("entity_type"),
+            }])
+
         return FakeResult([])
+
+    def execute_write(self, callback):
+        return callback(self)
 
     def __enter__(self):
         return self
@@ -64,6 +73,18 @@ class FakeDriver:
 
 
 @pytest.fixture(autouse=True)
+def _legacy_extractor(monkeypatch):
+    """These tests pin the spaCy path, which is now opt-in.
+
+    Production ingestion defaults to the LLM transformer; the legacy NER
+    path is selected explicitly here so the same-sentence relationship
+    evidence checks stay covered without calling a model.
+    """
+
+    monkeypatch.setenv("GRAPH_EXTRACTION_BACKEND", "spacy")
+
+
+@pytest.fixture(autouse=True)
 def _fake_driver(monkeypatch):
     driver = FakeDriver()
     monkeypatch.setattr(graph_service, "get_driver", lambda: driver)
@@ -75,8 +96,9 @@ def _fake_driver(monkeypatch):
             self.label_ = label_
 
     class _Sentence:
-        def __init__(self, ents):
+        def __init__(self, ents, text):
             self.ents = ents
+            self.text = text
 
     class _Doc:
         def __init__(self, sentences):
@@ -88,11 +110,11 @@ def _fake_driver(monkeypatch):
                 _Sentence([
                     _Entity("Microsoft", "ORG"),
                     _Entity("Acme Corp.", "ORG"),
-                ]),
+                ], "Microsoft works with Acme Corp."),
                 _Sentence([
                     _Entity("Microsoft", "ORG"),
                     _Entity("Paris", "GPE"),
-                ]),
+                ], "Microsoft is linked to Paris."),
             ])
 
     import app.masking.ner_service as ner_service
@@ -122,7 +144,10 @@ def test_ingest_merges_document_entity_and_relations(_fake_driver):
     result = graph_service.ingest_document_graph(
         document_id="doc-1",
         title="Annual report",
-        content="Microsoft and Acme Corp. met in Paris.",
+        content=(
+            "Microsoft works with Acme Corp. "
+            "Microsoft is linked to Paris."
+        ),
     )
 
     assert result["document_id"] == "doc-1"
@@ -130,8 +155,9 @@ def test_ingest_merges_document_entity_and_relations(_fake_driver):
 
     queries = [query for query, _ in _fake_driver.session_log.runs]
 
-    # Only MERGE-based writes: re-ingestion never duplicates nodes.
-    assert all("MERGE" in query for query in queries)
+    # Ingestion uses idempotent MERGEs and document-scoped refresh queries.
+    assert any("MERGE" in query for query in queries)
+    assert any("DELETE mention" in query for query in queries)
 
     # Parameterized Cypher only: no string interpolation.
     runtime_queries = [
@@ -146,11 +172,29 @@ def test_ingest_merges_document_entity_and_relations(_fake_driver):
     merged_pairs = [
         parameters
         for query, parameters in runtime_queries
-        if "[:RELATES_TO]->" in query
+        if "-[" in query and "RELATES_TO]->" in query
     ]
 
-    # Microsoft–Acme pair and Microsoft–Paris pair were created.
+    # Explicit source predicates support both relationships.
     assert len(merged_pairs) >= 2
+
+
+def test_spacy_fallback_does_not_turn_cooccurrence_into_a_relationship(
+    _fake_driver,
+):
+    graph_service.ingest_document_graph(
+        document_id="doc-cooccurrence",
+        title="Co-occurrence only",
+        content="Microsoft and Acme Corp. met in Paris.",
+    )
+
+    relationship_runs = [
+        parameters
+        for query, parameters in _fake_driver.session_log.runs
+        if "RELATES_TO]->" in query
+    ]
+
+    assert relationship_runs == []
 
 
 def test_ingest_rejects_empty_content(_fake_driver):

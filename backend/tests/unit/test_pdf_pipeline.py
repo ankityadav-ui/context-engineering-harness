@@ -7,6 +7,8 @@
 # No external service is contacted and no real document is used.
 #
 
+from types import SimpleNamespace
+
 import io
 
 import pymupdf
@@ -142,7 +144,7 @@ def pipeline(tmp_path, monkeypatch):
 def upload(pdf_path, mask_content="false"):
     with TestClient(app) as client:
         with open(pdf_path, "rb") as handle:
-            return client.post(
+            accepted = client.post(
                 "/documents/upload",
                 files={
                     "file": (
@@ -153,6 +155,32 @@ def upload(pdf_path, mask_content="false"):
                 },
                 data={"mask_content": mask_content},
             )
+        if accepted.status_code != 202:
+            return accepted
+
+        job = client.get(
+            f"/documents/jobs/{accepted.json()['job_id']}"
+        ).json()
+        if job["status"] != "completed":
+            error_code = (job.get("error") or {}).get("code")
+            return SimpleNamespace(
+                status_code={
+                    "invalid_pdf": 400,
+                    "no_retrievable_content": 422,
+                    "masking_rejected": 422,
+                    "embedding_failed": 500,
+                }.get(error_code, 500),
+                text=str(job),
+                json=lambda: {"detail": job["error"]["message"]},
+            )
+        return SimpleNamespace(
+            status_code=200,
+            text=accepted.text,
+            json=lambda: {
+                "document_id": job["document_id"],
+                **job["result"],
+            },
+        )
 
 
 def test_real_pdf_is_extracted_embedded_and_indexed(tmp_path, pipeline):
@@ -367,7 +395,7 @@ def test_blank_pdf_upload_fails_with_no_retrievable_content(
     response = upload(blank_path)
 
     assert response.status_code == 422
-    assert "No retrievable content" in response.json()["detail"]
+    assert "No retrievable text or content" in response.json()["detail"]
 
     # A rejected upload leaves no raw PDF or extracted images behind.
     assert list(pipeline["document_dir"].glob("*.pdf")) == []

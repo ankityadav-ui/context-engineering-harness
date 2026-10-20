@@ -2,10 +2,12 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -171,6 +173,43 @@ class Memory(Base):
     )
 
     # Record when the memory was last updated.
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class IngestionJob(Base):
+    """Durable state for one idempotent PDF ingestion request."""
+
+    __tablename__ = "ingestion_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_ingestion_job_idempotency_key",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    document_id = Column(String(36), nullable=False, unique=True, index=True)
+    idempotency_key = Column(String(64), nullable=False)
+    filename = Column(String(255), nullable=False)
+    file_path = Column(Text, nullable=False)
+    mask_content = Column(Boolean, nullable=False, default=False)
+    status = Column(String(20), nullable=False, default="queued", index=True)
+    stage = Column(String(40), nullable=False, default="queued")
+    stage_timings = Column(JSON, nullable=False, default=dict)
+    result = Column(JSON, nullable=True)
+    error_code = Column(String(80), nullable=True)
+    error_message = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
     updated_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

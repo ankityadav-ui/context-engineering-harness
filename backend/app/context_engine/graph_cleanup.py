@@ -38,6 +38,7 @@ from app.context_engine.entity_validation import (
     is_usable_entity_name,
 )
 from app.context_engine.graph_service import (
+    ALLOWED_RELATIONSHIPS,
     NEO4J_DATABASE,
     get_driver,
 )
@@ -83,7 +84,7 @@ MAX_REPORT_ITEMS = 200
 #   "name": str|None, "entity_type": str|None,
 #   "document_id": str|None, "source": str|None,
 # }
-# relationship: {"start": key, "end": key, "type": str}
+# relationship: {"start": key, "end": key, "type": str, ...properties}
 
 
 def fetch_snapshot() -> dict:
@@ -122,6 +123,7 @@ def fetch_snapshot() -> dict:
                 "start": record["start"],
                 "end": record["end"],
                 "type": record["type"],
+                **(record.get("properties") or {}),
             }
             for record in session.run(
                 """
@@ -130,7 +132,8 @@ def fetch_snapshot() -> dict:
                    OR a:Document OR b:Document
                 RETURN elementId(a) AS start,
                        elementId(b) AS end,
-                       type(r) AS type
+                       type(r) AS type,
+                       properties(r) AS properties
                 """
             )
         ]
@@ -297,6 +300,151 @@ def plan_cleanup(snapshot: dict) -> dict:
     """Compute removals, merges, and review flags. Pure function."""
 
     owned = classify_snapshot(snapshot)
+    owned_entity_keys = {
+        node["key"] for node in owned["owned_entities"]
+    }
+
+    missing_provenance = []
+    unsupported_relationships = []
+
+    for relationship in snapshot["relationships"]:
+        start_key = relationship["start"]
+        end_key = relationship["end"]
+        start_node = owned["nodes_by_key"].get(start_key)
+        end_node = owned["nodes_by_key"].get(end_key)
+        app_relationship = (
+            start_key in owned["app_document_keys"]
+            and end_key in owned_entity_keys
+        ) or (
+            start_key in owned_entity_keys
+            and end_key in owned_entity_keys
+        )
+
+        if (
+            app_relationship
+            and relationship["type"] not in ALLOWED_RELATIONSHIPS
+        ):
+            unsupported_relationships.append(
+                {
+                    "relationship": relationship["type"],
+                    "start": (
+                        (start_node or {}).get("document_id")
+                        or (start_node or {}).get("entity_id")
+                        or start_key
+                    ),
+                    "end": (
+                        (end_node or {}).get("entity_id")
+                        or (end_node or {}).get("document_id")
+                        or end_key
+                    ),
+                    "proposed": (
+                        "Review the edge and re-ingest using an "
+                        "allowlisted relationship type."
+                    ),
+                    "confidence": 0.95,
+                }
+            )
+
+        document_mention = (
+            relationship["type"] == "MENTIONS"
+            and start_key in owned["app_document_keys"]
+            and end_key in owned_entity_keys
+        )
+        entity_relationship = (
+            start_key in owned_entity_keys
+            and end_key in owned_entity_keys
+        )
+
+        if not (document_mention or entity_relationship):
+            continue
+
+        source_refs = relationship.get("source_refs") or []
+        if isinstance(source_refs, str):
+            source_refs = [source_refs]
+        elif not isinstance(source_refs, (list, tuple)):
+            source_refs = []
+
+        if document_mention:
+            document_id = (start_node or {}).get("document_id")
+            has_document_id = (
+                isinstance(document_id, str)
+                and bool(document_id.strip())
+                and relationship.get("document_id") == document_id
+            )
+            has_source_refs = has_document_id and bool(source_refs) and all(
+                isinstance(source_ref, str)
+                and bool(source_ref.strip())
+                and (
+                    source_ref == document_id
+                    or source_ref.startswith(f"{document_id}#page=")
+                )
+                for source_ref in source_refs
+            )
+            expected_provenance = ["document_id", "source_refs"]
+        else:
+            document_ids = relationship.get("document_ids") or []
+            if isinstance(document_ids, str):
+                document_ids = [document_ids]
+            elif not isinstance(document_ids, (list, tuple)):
+                document_ids = []
+            valid_document_ids = [
+                document_id
+                for document_id in document_ids
+                if isinstance(document_id, str) and document_id.strip()
+            ]
+            has_document_id = bool(document_ids) and (
+                len(valid_document_ids) == len(document_ids)
+            )
+            has_source_refs = (
+                has_document_id
+                and bool(source_refs)
+                and all(
+                    isinstance(source_ref, str)
+                    and bool(source_ref.strip())
+                    and any(
+                        source_ref == document_id
+                        or source_ref.startswith(
+                            f"{document_id}#page="
+                        )
+                        for document_id in valid_document_ids
+                    )
+                    for source_ref in source_refs
+                )
+            )
+            expected_provenance = ["document_ids", "source_refs"]
+
+        missing_fields = []
+        if not has_document_id:
+            missing_fields.append(expected_provenance[0])
+        if not has_source_refs:
+            missing_fields.append("source_refs")
+
+        if missing_fields:
+            missing_provenance.append(
+                {
+                    "relationship": relationship["type"],
+                    "start": (
+                        (start_node or {}).get("document_id")
+                        or (start_node or {}).get("entity_id")
+                        or start_key
+                    ),
+                    "end": (
+                        (end_node or {}).get("entity_id")
+                        or (end_node or {}).get("document_id")
+                        or end_key
+                    ),
+                    "current": {
+                        field: relationship.get(field)
+                        for field in expected_provenance
+                    },
+                    "proposed": (
+                        "Re-ingest the source document to restore "
+                        "validated provenance."
+                    ),
+                    "missing_fields": missing_fields,
+                    "confidence": 0.95,
+                }
+            )
 
     removals = []
     removal_ids = set()
@@ -526,6 +674,8 @@ def plan_cleanup(snapshot: dict) -> dict:
         "type_implausible": type_implausible,
         "ambiguous": ambiguous,
         "relationships_to_invalid": relationships_to_invalid,
+        "missing_provenance": missing_provenance,
+        "unsupported_relationships": unsupported_relationships,
         "needs_review_ownership": [
             _entity_view(node, owned)
             for node in owned["needs_review_ownership"]
@@ -575,6 +725,10 @@ def build_report(snapshot: dict, plan: dict | None = None) -> dict:
         "relationships_to_suspected_invalid": _bound(
             plan["relationships_to_invalid"]
         ),
+        "missing_provenance": _bound(plan["missing_provenance"]),
+        "unsupported_relationships": _bound(
+            plan["unsupported_relationships"]
+        ),
         "ambiguous_for_review": _bound(plan["ambiguous"]),
         "type_implausible_for_review": _bound(
             plan["type_implausible"]
@@ -590,6 +744,8 @@ def build_report(snapshot: dict, plan: dict | None = None) -> dict:
                 + len(plan["ambiguous"])
                 + len(plan["needs_review_ownership"])
                 + len(plan["type_implausible"])
+                + len(plan["missing_provenance"])
+                + len(plan["unsupported_relationships"])
             ),
         },
         "destructive_changes_performed": False,

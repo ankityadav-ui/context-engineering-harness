@@ -4,12 +4,14 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import uuid
 from pathlib import Path
 
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+import api_client
 from context_inspector import render_page as render_context_inspector
 from masking_workflow import MaskingError, prepare_chat_message
 
@@ -241,6 +243,8 @@ DEFAULTS = {
     "uploaded_document_fingerprints": set(),
     # Last successful upload result, shown once after a rerun.
     "documents_last_upload": None,
+    "documents_retry_payload": None,
+    "active_ingestion_jobs": {},
     # Document the chat is currently grounded in. Set on every successful
     # upload (chat or Documents page) so "summarise this" resolves the
     # document the user just added instead of searching the whole index.
@@ -251,7 +255,7 @@ DEFAULTS = {
 
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
-        st.session_state[key] = value
+        st.session_state[key] = value.copy() if isinstance(value, (dict, set)) else value
 
 
 # =========================================================
@@ -365,19 +369,20 @@ def upload_pdf_document(
     file_bytes: bytes,
     filename: str,
     mask_content: bool,
+    idempotency_key: str,
 ) -> dict:
     """Upload one PDF to the backend ingestion endpoint.
 
-    Multipart POST /documents/upload; the response is only returned
-    after the backend finished extraction, OCR, embedding, and
-    indexing, so callers can trust the reported status.
+    Multipart POST /documents/upload; the response accepts a durable
+    job that the UI polls without blocking the rest of the app.
     """
     buffer = io.BytesIO(file_bytes)
     response = requests.post(
         f"{API_URL}/documents/upload",
         files={"file": (filename, buffer, "application/pdf")},
         data={"mask_content": "true" if mask_content else "false"},
-        timeout=900,
+        headers={"Idempotency-Key": idempotency_key},
+        timeout=60,
     )
     response.raise_for_status()
     return response.json()
@@ -396,6 +401,94 @@ def backend_status() -> tuple[bool, str]:
         return False, "Unexpected health response"
     except requests.RequestException:
         return False, "Unavailable"
+
+
+@st.fragment(run_every="2s")
+def render_ingestion_job_status() -> None:
+    """Poll accepted jobs independently of the page and chat UI."""
+    jobs = st.session_state.get("active_ingestion_jobs", {})
+    for job_id, metadata in list(jobs.items()):
+        try:
+            job = api_client.get_ingestion_job(job_id, api_url=API_URL)
+        except (api_client.APIError, requests.RequestException, ValueError) as exc:
+            st.warning(
+                f"Could not refresh ingestion status for "
+                f"{metadata['filename']}: {exc}"
+            )
+            continue
+
+        status = job.get("status")
+        stage = job.get("stage", "queued")
+        filename = metadata["filename"]
+        if status in {"queued", "processing"}:
+            st.info(f"Processing {filename}: {stage.replace('_', ' ')}")
+            progress = {
+                "queued": 0.05,
+                "upload_validation": 0.1,
+                "text_extraction": 0.2,
+                "ocr": 0.3,
+                "table_extraction": 0.4,
+                "image_extraction": 0.5,
+                "chunking": 0.6,
+                "masking": 0.7,
+                "embedding": 0.8,
+                "pinecone_indexing": 0.9,
+                "knowledge_graph": 0.95,
+                "completion": 0.98,
+            }.get(stage, 0.15)
+            st.progress(progress)
+            continue
+
+        if status == "completed":
+            result = {
+                "document_id": job.get("document_id"),
+                **(job.get("result") or {}),
+            }
+            st.session_state.active_document_id = result["document_id"]
+            st.session_state.active_document_name = filename
+            st.session_state.active_document_masked = bool(
+                result.get("masking_applied")
+            )
+            st.session_state.documents_last_upload = {
+                **result,
+                "_mask_requested": metadata["mask_content"],
+            }
+            if metadata.get("origin") == "chat":
+                masking_note = ""
+                if result.get("masking_applied"):
+                    masking_note = (
+                        f" Masking replaced "
+                        f"{result.get('newly_masked_entities', 0)} distinct "
+                        "values and preserved "
+                        f"{result.get('existing_placeholders', 0)} existing "
+                        "placeholders."
+                    )
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": (
+                        f"Finished indexing {filename} "
+                        f"(document id `{result['document_id']}`, "
+                        f"{result.get('content_units', 0)} content units)."
+                        f"{masking_note}"
+                    ),
+                })
+            st.success(f"Finished processing {filename}.")
+            del jobs[job_id]
+            refresh_document_list()
+            st.rerun()
+
+        if status == "failed":
+            error = job.get("error") or {}
+            st.error(
+                f"Processing {filename} failed: "
+                f"{error.get('message', 'Unknown ingestion failure')}"
+            )
+            if st.button("Retry processing", key=f"retry_ingestion_{job_id}"):
+                try:
+                    api_client.retry_ingestion_job(job_id, api_url=API_URL)
+                    st.info(f"Retry queued for {filename}.")
+                except (api_client.APIError, requests.RequestException, ValueError) as exc:
+                    st.error(f"Could not retry {filename}: {exc}")
 
 
 def sync_system_prompt_editor() -> None:
@@ -558,7 +651,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if st.button("＋  New chat", use_container_width=True, type="primary"):
+    if st.button("＋  New chat", width="stretch", type="primary"):
         try:
             created = create_conversation("New chat")
             st.session_state.conversation_id = created.get("id")
@@ -582,7 +675,6 @@ with st.sidebar:
         ("Chat", "💬"),
         ("Documents", "📄"),
         ("Context Inspector", "🧩"),
-        ("Knowledge Graph", "🕸️"),
         ("Diagnostics", "⚙️"),
     ]
 
@@ -590,7 +682,7 @@ with st.sidebar:
         if st.button(
             f"{icon}  {page_name}",
             key=f"nav_{page_name}",
-            use_container_width=True,
+            width="stretch",
             type=(
                 "primary"
                 if st.session_state.active_page == page_name
@@ -599,6 +691,78 @@ with st.sidebar:
         ):
             st.session_state.active_page = page_name
             st.rerun()
+
+    st.divider()
+
+    # Memory management section
+    st.markdown(
+        '<div class="eyebrow">Memory</div>',
+        unsafe_allow_html=True,
+    )
+
+    # List memories
+    user_id = st.session_state.get("user_id", "current_user")
+    try:
+        memories = api_client.list_memories(user_id=user_id, api_url=API_URL)
+        memory_list = memories.get("memories", [])
+        memory_load_error = None
+    except (api_client.APIError, requests.RequestException, ValueError) as exc:
+        memory_list = []
+        memory_load_error = str(exc)
+
+    if memory_load_error:
+        st.warning(f"Could not load memories: {memory_load_error}")
+
+    if memory_list:
+        for memory in memory_list:
+            memory_id = memory.get("id")
+            memory_type = memory.get("memory_type", "unknown")
+            content = memory.get("content", "")[:80]
+            importance = memory.get("importance", 3)
+            st.caption(f"{memory_type}: {content}... (importance: {importance})")
+            if st.button("🗑 Delete", key=f"delete_mem_{memory_id}", help=f"Delete memory {memory_id}"):
+                st.session_state[f"confirm_delete_mem_{memory_id}"] = True
+                st.rerun()
+            if st.session_state.get(f"confirm_delete_mem_{memory_id}"):
+                st.warning("Are you sure you want to delete this memory?")
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("Delete", key=f"confirm_mem_{memory_id}"):
+                        try:
+                            api_client.delete_memory(
+                                memory_id=memory_id,
+                                user_id=user_id,
+                                api_url=API_URL,
+                            )
+                            st.success("Memory deleted")
+                            st.session_state[f"confirm_delete_mem_{memory_id}"] = False
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Delete failed: {exc}")
+                with col_no:
+                    if st.button("Cancel", key=f"cancel_mem_{memory_id}"):
+                        st.session_state[f"confirm_delete_mem_{memory_id}"] = False
+                        st.rerun()
+    else:
+        st.caption("No memories yet. Create one below.")
+
+    # Create new memory
+    st.caption("")
+    memory_type = st.selectbox("Type", ["fact", "reflection", "goal", "note"])
+    content = st.text_input("Content")
+    importance = st.slider("Importance", 1, 5, 3)
+    if st.button("Create Memory", width="stretch"):
+        try:
+            api_client.create_memory(
+                user_id=user_id,
+                memory_type=memory_type,
+                content=content,
+                importance=importance,
+                api_url=API_URL,
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Create failed: {exc}")
 
     st.divider()
 
@@ -712,7 +876,7 @@ with st.sidebar:
                 "Save instructions",
                 key="save_system_prompt",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 disabled=not selected_conversation,
                 on_click=save_system_prompt_callback,
             )
@@ -721,7 +885,7 @@ with st.sidebar:
             st.button(
                 "Reset prompt",
                 key="reset_system_prompt",
-                use_container_width=True,
+                width="stretch",
                 disabled=not selected_conversation,
                 on_click=reset_system_prompt_callback,
             )
@@ -768,27 +932,74 @@ with st.sidebar:
             is_active = conversation_id == st.session_state.conversation_id
             message_count = conversation.get("message_count", 0)
             label = f"{'● ' if is_active else ''}{title}  ·  {message_count}"
-            if st.button(
-                label,
-                key=f"conversation_{conversation_id}",
-                use_container_width=True,
-                type="primary" if is_active else "secondary",
-                help=f"Open conversation {conversation_id}",
-            ):
-                try:
-                    st.session_state.messages = load_conversation_messages(conversation_id)
-                    st.session_state.conversation_id = conversation_id
-                    # Do not carry one conversation's document scope into
-                    # another conversation.
-                    st.session_state.active_document_id = None
-                    st.session_state.active_document_name = None
-                    st.session_state.active_document_masked = False
-                    st.session_state.active_page = "Chat"
+            col1, col2 = st.columns([6, 1])
+            with col1:
+                if st.button(
+                    label,
+                    key=f"conversation_{conversation_id}",
+                    width="stretch",
+                    type="primary" if is_active else "secondary",
+                    help=f"Open conversation {conversation_id}",
+                ):
+                    try:
+                        st.session_state.messages = load_conversation_messages(conversation_id)
+                        st.session_state.conversation_id = conversation_id
+                        # Do not carry one conversation's document scope into
+                        # another conversation.
+                        st.session_state.active_document_id = None
+                        st.session_state.active_document_name = None
+                        st.session_state.active_document_masked = False
+                        st.session_state.active_page = "Chat"
+                        st.rerun()
+                    except (requests.RequestException, ValueError) as exc:
+                        st.error(f"Could not load conversation: {exc}")
+            with col2:
+                if st.button(
+                    "🗑",
+                    key=f"delete_{conversation_id}",
+                    help=f"Delete conversation {title}",
+                    width="stretch",
+                ):
+                    st.session_state[f"confirm_delete_{conversation_id}"] = True
                     st.rerun()
-                except (requests.RequestException, ValueError) as exc:
-                    st.error(f"Could not load conversation: {exc}")
 
     st.divider()
+
+    # Handle conversation deletion confirmations
+    for conversation in st.session_state.conversation_list:
+        conversation_id = conversation.get("id")
+        if st.session_state.get(f"confirm_delete_{conversation_id}"):
+            conversation_title = conversation.get("title") or "Unnamed"
+            st.warning(
+                f'Are you sure you want to delete conversation "{conversation_title}"?'
+            )
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("Delete", key=f"confirm_{conversation_id}"):
+                    try:
+                        result = api_client.delete_conversation(
+                            conversation_id=conversation_id,
+                            session_id=st.session_state.get("session_id"),
+                            api_url=API_URL,
+                        )
+                        st.success(
+                            f"Conversation deleted. Messages: {result.get('messages_deleted', 0)}"
+                        )
+                        # Clear stale state
+                        st.session_state.conversation_id = None
+                        st.session_state.messages = []
+                        st.session_state.active_document_id = None
+                        st.session_state.active_document_name = None
+                        st.session_state.active_document_masked = False
+                        st.session_state.active_page = "Chat"
+                        refresh_conversation_list()
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Delete failed: {exc}")
+            with col_no:
+                if st.button("Cancel", key=f"cancel_{conversation_id}"):
+                    st.session_state[f"confirm_delete_{conversation_id}"] = False
+                    st.rerun()
 
     healthy, _ = backend_status()
 
@@ -796,6 +1007,14 @@ with st.sidebar:
         st.success("API connected")
     else:
         st.error("API unavailable")
+
+    if st.session_state.active_ingestion_jobs:
+        st.divider()
+        st.markdown(
+            '<div class="eyebrow">Document processing</div>',
+            unsafe_allow_html=True,
+        )
+        render_ingestion_job_status()
 
     st.caption(f"FastAPI: {API_URL}")
 
@@ -805,6 +1024,12 @@ with st.sidebar:
 # =========================================================
 
 page = st.session_state.active_page
+
+# A session started before a page was removed must not render a blank
+# screen: unknown page names fall back to Chat.
+if page not in {name for name, _ in pages}:
+    st.session_state.active_page = "Chat"
+    page = "Chat"
 
 if page == "Chat":
     st.title("Chat")
@@ -837,7 +1062,7 @@ if page == "Chat":
             if st.button(
                 "Ask across all documents",
                 key="clear_active_document",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.active_document_id = None
                 st.session_state.active_document_name = None
@@ -914,6 +1139,7 @@ if page == "Chat":
         "Message your context engine...",
         accept_file=True,
         file_type=["pdf"],
+        max_upload_size=25,
     )
 
     if prompt:
@@ -924,10 +1150,10 @@ if page == "Chat":
             message_text = (getattr(prompt, "text", "") or "").strip()
             attached_files = getattr(prompt, "files", []) or []
 
+        accepted_attachment_job = False
         if attached_files:
-            # Attachments are ingested through the same backend pipeline
-            # as the Documents page: extraction, OCR, embedding, and
-            # indexing all happen server-side before we report success.
+            # Attachments use the same durable ingestion jobs as the
+            # Documents page; accepting a job does not block chat.
             for attached in attached_files:
                 attached_name = getattr(attached, "name", "attachment")
 
@@ -953,57 +1179,45 @@ if page == "Chat":
                         "role": "assistant",
                         "content": (
                             f"{attached_name} was already uploaded in "
-                            "this session, so it was not indexed again."
+                            "this session, so it was not indexed again. "
+                            "To reprocess it with the current pipeline, "
+                            "use the Documents page's new-document option."
                         ),
                     })
                     continue
 
                 try:
-                    with st.spinner(
-                        f"Uploading and indexing {attached_name}..."
-                    ):
-                        result = upload_pdf_document(
-                            attached_bytes,
-                            attached_name,
-                            mask_content=st.session_state.masking_enabled,
-                        )
+                    mask_requested = bool(
+                        st.session_state.masking_enabled
+                    )
+                    result = upload_pdf_document(
+                        attached_bytes,
+                        attached_name,
+                        mask_content=mask_requested,
+                        idempotency_key=(
+                            f"{fingerprint}:mask={int(mask_requested)}"
+                        ),
+                    )
 
                     st.session_state.uploaded_document_fingerprints.add(
                         fingerprint
                     )
-                    # Ground the rest of this chat in the new document.
-                    st.session_state.active_document_id = result.get(
-                        "document_id"
-                    )
-                    st.session_state.active_document_name = attached_name
-                    st.session_state.active_document_masked = bool(
-                        result.get("masking_applied")
-                    )
-                    refresh_document_list()
-
-                    masking_note = ""
-
-                    if result.get("masking_applied"):
-                        masking_note = (
-                            f", masking confirmed by the backend: "
-                            f"{result.get('masked_entities', 0)} "
-                            f"entities masked, safety check passed: "
-                            f"{result.get('masking_safety_passed')}"
-                        )
-                    elif st.session_state.masking_enabled:
-                        masking_note = (
-                            ", but masking was requested and was NOT "
-                            "confirmed by the backend"
-                        )
+                    st.session_state.active_ingestion_jobs[
+                        result["job_id"]
+                    ] = {
+                        "filename": attached_name,
+                        "mask_content": mask_requested,
+                        "origin": "chat",
+                    }
+                    accepted_attachment_job = True
 
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": (
-                            f"Uploaded and indexed {attached_name} "
-                            f"(document id `{result.get('document_id')}`, "
-                            f"{result.get('content_units', 0)} content "
-                            f"units{masking_note}). Ask questions about it "
-                            "on the Documents page."
+                            f"Accepted {attached_name} for processing "
+                            f"(job `{result['job_id']}`). You can keep "
+                            "using chat; I’ll make it the selected "
+                            "document when indexing completes."
                         ),
                     })
 
@@ -1027,7 +1241,21 @@ if page == "Chat":
                     })
 
         if message_text:
-            if not st.session_state.get("conversation_id"):
+            if accepted_attachment_job:
+                st.session_state.messages.extend(
+                    [
+                        {"role": "user", "content": message_text},
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "Your question was not sent because the "
+                                "attached PDF is still processing. Ask "
+                                "again after the job completes."
+                            ),
+                        },
+                    ]
+                )
+            elif not st.session_state.get("conversation_id"):
                 try:
                     created = create_conversation(message_text[:60] or "New chat")
                     st.session_state.conversation_id = created.get("id")
@@ -1036,10 +1264,11 @@ if page == "Chat":
                     st.error(f"Could not start a persistent conversation: {exc}")
                     st.stop()
 
-            # send_chat_message appends the user turn after masking, so
-            # a failed safety check never leaves a sent-looking message.
-            with st.spinner("Waiting for the backend response..."):
-                send_chat_message(message_text)
+            if not accepted_attachment_job:
+                # send_chat_message appends the user turn after masking, so
+                # a failed safety check never leaves a sent-looking message.
+                with st.spinner("Waiting for the backend response..."):
+                    send_chat_message(message_text)
 
         st.rerun()
 
@@ -1055,9 +1284,11 @@ elif page == "Documents":
         "PDF file",
         type=["pdf"],
         key="documents_uploader",
+        max_upload_size=25,
         help=(
             "The backend extracts text, runs OCR on scanned pages, "
-            "embeds the content, and indexes it in the vector store."
+            "embeds the content, and indexes it in the vector store. "
+            "Maximum file size is 25 MiB."
         ),
     )
 
@@ -1071,8 +1302,20 @@ elif page == "Documents":
         ),
     )
 
+    reprocess_as_new_document = st.checkbox(
+        "Reprocess identical PDF as a new document",
+        key="documents_reprocess_identical",
+        help=(
+            "Creates a new document ID and indexes a fresh copy using "
+            "the current extraction, masking, and embedding pipeline. "
+            "The previously indexed document is left unchanged."
+        ),
+    )
+
     upload_clicked = st.button(
-        "Upload and index",
+        "Reprocess as new document"
+        if reprocess_as_new_document
+        else "Upload and index",
         type="primary",
         key="documents_upload_button",
         disabled=uploaded_file is None,
@@ -1082,9 +1325,12 @@ elif page == "Documents":
         file_bytes = uploaded_file.getvalue()
         fingerprint = hashlib.sha256(file_bytes).hexdigest()
 
-        if fingerprint in st.session_state.uploaded_document_fingerprints:
-            # Rerun/double-click protection: identical bytes are never
-            # pushed through ingestion twice in one session.
+        if (
+            fingerprint in st.session_state.uploaded_document_fingerprints
+            and not reprocess_as_new_document
+        ):
+            # Rerun/double-click protection: explicit reprocessing is
+            # available above and always receives a fresh document id.
             st.info(
                 f"{uploaded_file.name} was already uploaded in this "
                 "session with identical content, so it was not indexed "
@@ -1092,15 +1338,17 @@ elif page == "Documents":
             )
         else:
             try:
-                with st.spinner(
-                    "Uploading and indexing... large or scanned PDFs "
-                    "can take a while."
-                ):
-                    result = upload_pdf_document(
-                        file_bytes,
-                        uploaded_file.name,
-                        mask_content=mask_before_indexing,
-                    )
+                idempotency_key = (
+                    str(uuid.uuid4())
+                    if reprocess_as_new_document
+                    else f"{fingerprint}:mask={int(mask_before_indexing)}"
+                )
+                result = upload_pdf_document(
+                    file_bytes,
+                    uploaded_file.name,
+                    mask_content=mask_before_indexing,
+                    idempotency_key=idempotency_key,
+                )
 
             except requests.HTTPError as exc:
                 detail = http_error_detail(exc)
@@ -1113,24 +1361,15 @@ elif page == "Documents":
                 st.session_state.uploaded_document_fingerprints.add(
                     fingerprint
                 )
-                # The next chat question about "this document" should
-                # target what was just uploaded, wherever it came from.
-                st.session_state.active_document_id = result.get(
-                    "document_id"
-                )
-                st.session_state.active_document_name = uploaded_file.name
-                st.session_state.active_document_masked = bool(
-                    result.get("masking_applied")
-                )
-                # Record which masking mode this result belongs to, so
-                # the notice can never imply masking that was not done.
-                st.session_state.documents_last_upload = {
-                    **result,
-                    "_mask_requested": mask_before_indexing,
+                st.session_state.active_ingestion_jobs[result["job_id"]] = {
+                    "filename": uploaded_file.name,
+                    "mask_content": mask_before_indexing,
+                    "origin": "documents",
                 }
-                # Refresh the listing before the success notice shows on
-                # the next run, so the new document is visible at once.
-                refresh_document_list()
+                st.info(
+                    f"Upload accepted as job `{result['job_id']}`. "
+                    "Processing continues in the background."
+                )
                 st.rerun()
 
     if st.session_state.documents_last_upload:
@@ -1152,7 +1391,12 @@ elif page == "Documents":
         if result.get("masking_applied"):
             st.caption(
                 "Masking confirmed by the backend: "
-                f"{result.get('masked_entities', 0)} entities masked · "
+                f"{result.get('newly_masked_entities', result.get('masked_entities', 0))} "
+                "distinct sensitive values replaced in this operation · "
+                f"{result.get('existing_placeholders', 0)} distinct "
+                "pre-existing placeholders preserved "
+                f"({result.get('existing_placeholder_occurrences', 0)} "
+                "occurrences) · "
                 f"safety check passed: "
                 f"{result.get('masking_safety_passed')}"
             )
@@ -1215,7 +1459,49 @@ elif page == "Documents":
                     f"{'yes' if document.get('pdf_stored') else 'no'}"
                 )
 
+                _, delete_column = st.columns([6, 1])
+                with delete_column:
+                    if st.button(
+                        "🗑",
+                        key=f"delete_doc_btn_{document.get('document_id')}",
+                        help="Delete document",
+                        width="stretch",
+                    ):
+                        st.session_state[
+                            f"confirm_delete_doc_{document.get('document_id')}"
+                        ] = True
+                        st.rerun()
+
     st.divider()
+
+    # Handle document deletion confirmations
+    for document in st.session_state.get("document_list", []):
+        document_id = document.get("document_id")
+        if st.session_state.get(f"confirm_delete_doc_{document_id}"):
+            st.warning(
+                f'Are you sure you want to delete document "{document_id}"?'
+            )
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("Delete", key=f"confirm_doc_{document_id}"):
+                    try:
+                        result = api_client.delete_document(
+                            document_id=document_id,
+                            api_url=API_URL,
+                        )
+                        st.success(
+                            f"Document deleted. Removed files: {len(result.get('removed_files', []))}"
+                        )
+                        # Refresh document list
+                        refresh_document_list()
+                        st.session_state[f"confirm_delete_doc_{document_id}"] = False
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Delete failed: {exc}")
+            with col_no:
+                if st.button("Cancel", key=f"cancel_doc_{document_id}"):
+                    st.session_state[f"confirm_delete_doc_{document_id}"] = False
+                    st.rerun()
 
     # -------------------------------------------------- Document Q&A
     st.subheader("Ask a question")
@@ -1268,9 +1554,31 @@ elif page == "Documents":
         "sent by Ask is not masked by that toggle."
     )
 
-    if st.button("Ask", type="primary", key="documents_ask_button"):
-        if not question.strip():
+    retry_payload = st.session_state.get("documents_retry_payload")
+    if retry_payload:
+        st.info(
+            "The last question can be retried against the same document "
+            "selection without uploading again."
+        )
+        retry_clicked = st.button(
+            "Retry previous question",
+            key="retry_documents_question",
+        )
+    else:
+        retry_clicked = False
+
+    ask_clicked = st.button(
+        "Ask",
+        type="primary",
+        key="documents_ask_button",
+    )
+
+    if ask_clicked or retry_clicked:
+        if retry_clicked and retry_payload:
+            payload = retry_payload
+        elif not question.strip():
             st.warning("Enter a question first.")
+            payload = None
         else:
             payload = {
                 "query": question.strip(),
@@ -1281,6 +1589,8 @@ elif page == "Documents":
             if use_conversation and st.session_state.conversation_id:
                 payload["conversation_id"] = st.session_state.conversation_id
 
+        if payload is not None:
+            result = None
             try:
                 with st.spinner(
                     "Retrieving context and asking the model..."
@@ -1288,9 +1598,14 @@ elif page == "Documents":
                     result = ask_documents(payload)
 
             except requests.HTTPError as exc:
-                # LLM/config failures surface here (e.g. 503) and are
-                # distinct from "no documents matched" below.
                 detail = http_error_detail(exc)
+                retryable = bool(
+                    exc.response
+                    and exc.response.headers.get("X-Retryable") == "true"
+                )
+                if retryable:
+                    st.session_state.documents_retry_payload = payload
+                    st.rerun()
                 st.error(f"Backend error: {detail or exc}")
 
             except requests.RequestException as exc:
@@ -1300,6 +1615,9 @@ elif page == "Documents":
                 )
 
             else:
+                st.session_state.documents_retry_payload = None
+
+            if result is not None:
                 answer = result.get("answer", "")
 
                 if answer:
@@ -1387,12 +1705,6 @@ elif page == "Context Inspector":
     )
 
 
-elif page == "Knowledge Graph":
-    st.title("Knowledge Graph")
-    st.caption("Explore entities and their relationships.")
-    st.info("Graph entity and relationship browsing will be connected next.")
-
-
 elif page == "Diagnostics":
     st.title("Diagnostics")
 
@@ -1414,6 +1726,58 @@ elif page == "Diagnostics":
                     st.warning(f"{label}: not configured")
         else:
             st.json(capabilities)
+
+        st.divider()
+        st.subheader("Cleanup report")
+        try:
+            report = api_client.cleanup_report(api_url=API_URL)
+            st.caption(f"Mode: {report.get('mode', 'unknown')}")
+            st.write(f"Generated: {report.get('generated_at', 'unknown')}")
+            st.write(f"Labels: {len(report.get('counts', {}).get('labels', []))}")
+            st.write(f"Relationship types: {len(report.get('counts', {}).get('relationship_types', []))}")
+
+            findings = (
+                ("Malformed/placeholder", "malformed_or_placeholder"),
+                ("Suspected duplicates", "suspected_duplicates"),
+                ("Conflicting entity labels", "conflicting_entity_labels"),
+                (
+                    "Relationships to invalid entities",
+                    "relationships_to_suspected_invalid",
+                ),
+                ("Missing provenance", "missing_provenance"),
+                ("Unsupported relationships", "unsupported_relationships"),
+                ("Ambiguous for review", "ambiguous_for_review"),
+                ("Type implausible for review", "type_implausible_for_review"),
+                (
+                    "Ownership ambiguous for review",
+                    "ownership_ambiguous_for_review",
+                ),
+            )
+
+            for label, key in findings:
+                section = report.get(key, {})
+                if isinstance(section, dict):
+                    total = section.get("total", 0)
+                    items = section.get("items", [])
+                else:
+                    total = section
+                    items = []
+
+                st.write(f"{label}: {total}")
+                if items:
+                    with st.expander(f"Review {label.lower()}"):
+                        st.json(items)
+
+            st.write(f"Planned removals: {report.get('planned_actions', {}).get('removals', 0)}")
+            st.write(f"Planned merges: {report.get('planned_actions', {}).get('merges', 0)}")
+            st.write(f"Needs review: {report.get('planned_actions', {}).get('needs_review', 0)}")
+            st.write(f"Destructive changes performed: {report.get('destructive_changes_performed', False)}")
+        except (
+            api_client.APIError,
+            requests.RequestException,
+            ValueError,
+        ) as exc:
+            st.error(f"Could not generate cleanup report: {exc}")
 
     except requests.RequestException as exc:
         st.error(f"Could not load diagnostics: {exc}")

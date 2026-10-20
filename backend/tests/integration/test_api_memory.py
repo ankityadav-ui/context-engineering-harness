@@ -42,10 +42,15 @@ def test_create_list_and_delete_memory(api_client):
     )
 
     assert deleted.status_code == 200
-    assert deleted.json() == {
-        "deleted": True,
-        "memory_id": memory["id"],
-    }
+    deleted_body = deleted.json()
+    assert deleted_body["deleted"] is True
+    assert deleted_body["memory_id"] == memory["id"]
+    assert "dry_run" in deleted_body
+    assert deleted_body["dry_run"] is False
+    assert "other_memories_preserved" in deleted_body
+    assert deleted_body["other_memories_preserved"] is True
+    assert "remaining_memory_count" in deleted_body
+    assert deleted_body["remaining_memory_count"] == 0
 
     assert (
         api_client.get(

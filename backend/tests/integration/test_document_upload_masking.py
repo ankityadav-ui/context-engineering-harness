@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import app
-from app.rag import document_service
+from app.rag import document_service, text_extractor
 
 
 RAW_TEXT = "Contact John Doe at john@example.com for details."
@@ -26,18 +26,25 @@ def masked_text_stub(text, document_id, registry=None, **kwargs):
     pipeline passes to every unit, plus the header-name flag.
     """
 
-    masked = (
-        text.replace("john@example.com", "[EMAIL_1]")
-        .replace("John Doe", "[PERSON_1]")
-        .replace("Jane Smith", "[PERSON_2]")
+    replacements = (
+        ("EMAIL", "john@example.com"),
+        ("PERSON", "John Doe"),
+        ("PERSON", "Jane Smith"),
     )
+    masked = text
+    entities = []
+    for entity_type, value in replacements:
+        if value in text:
+            placeholder = registry.placeholder_for(entity_type, value)
+            masked = masked.replace(value, placeholder)
+            entities.append(SimpleNamespace(entity_type=entity_type))
 
     return {
         "result": SimpleNamespace(
             document_id=document_id,
             original_text=text,
             masked_text=masked,
-            entities=[SimpleNamespace(entity_type="EMAIL")],
+            entities=entities,
             safety_passed=True,
         ),
         "safety": {"passed": True, "reasons": []},
@@ -106,7 +113,7 @@ def pipeline_recorder(monkeypatch, tmp_path):
             {
                 "document_id": document_id,
                 "page_number": 2,
-                "content": "Scanned note for Jane Smith.",
+                "content": "Scanned note for John Doe and Jane Smith.",
                 "source": "pdf_ocr",
             }
         ]
@@ -157,6 +164,11 @@ def pipeline_recorder(monkeypatch, tmp_path):
         return masked_text_stub(text, document_id, registry)
 
     monkeypatch.setattr(document_service, "extract_text_from_pdf", fake_text_extraction)
+    monkeypatch.setattr(
+        text_extractor,
+        "get_pdf_page_count",
+        lambda _document_path: 3,
+    )
     monkeypatch.setattr(document_service, "extract_text_with_ocr", fake_ocr)
     monkeypatch.setattr(document_service, "extract_tables_from_pdf", fake_tables)
     monkeypatch.setattr(document_service, "extract_images_from_pdf", fake_images)
@@ -170,10 +182,30 @@ def pipeline_recorder(monkeypatch, tmp_path):
 def upload(client, mask_content=None):
     data = {"mask_content": mask_content} if mask_content else None
 
-    return client.post(
+    accepted = client.post(
         "/documents/upload",
         files={"file": ("sample.pdf", b"%PDF-1.4 fake", "application/pdf")},
         data=data,
+    )
+    if accepted.status_code != 202:
+        return accepted
+
+    job = client.get(
+        f"/documents/jobs/{accepted.json()['job_id']}"
+    ).json()
+    if job["status"] == "failed":
+        return SimpleNamespace(
+            status_code=422 if job["error"]["code"] == "masking_rejected" else 500,
+            text=str(job),
+            json=lambda: {"detail": job["error"]["message"]},
+        )
+    return SimpleNamespace(
+        status_code=200,
+        text=accepted.text,
+        json=lambda: {
+            "document_id": job["document_id"],
+            **job["result"],
+        },
     )
 
 
@@ -187,8 +219,8 @@ def test_masked_upload_indexes_only_masked_content(pipeline_recorder):
 
     assert body["masking_applied"] is True
     assert body["masking_safety_passed"] is True
-    # Two text-bearing units were masked (page text + OCR text + table
-    # content): three masking calls in total.
+    # The email and two distinct people were masked. John Doe appears
+    # in both PDF and OCR text but is counted once for the document.
     assert body["masked_entities"] == 3
 
     # Everything embedded and upserted is sanitized; the raw email and

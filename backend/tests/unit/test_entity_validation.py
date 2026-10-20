@@ -67,6 +67,18 @@ def test_plausible_names_are_accepted(name):
     assert is_usable_entity_name(name) is True
 
 
+def test_hyphenated_model_identifier_is_allowed_only_when_requested():
+    assert is_usable_entity_name("Luma-4 Sensor") is False
+    assert is_usable_entity_name(
+        "Luma-4 Sensor",
+        allow_hyphenated_model_tokens=True,
+    ) is True
+    assert is_usable_entity_name(
+        "0nd",
+        allow_hyphenated_model_tokens=True,
+    ) is False
+
+
 # --------------------------------------------------
 # Type plausibility (separate from name quality)
 # --------------------------------------------------
@@ -185,7 +197,18 @@ class _RecordingSession:
                 }
             ])
 
+        if "MERGE (entity:Entity" in query:
+            return _RecordingResult([
+                {
+                    "entity_id": parameters.get("entity_id"),
+                    "entity_type": parameters.get("entity_type"),
+                }
+            ])
+
         return _RecordingResult()
+
+    def execute_write(self, callback):
+        return callback(self)
 
     def __enter__(self):
         return self
@@ -234,6 +257,14 @@ def _ingested_entities(driver):
         for query, parameters in driver.session_log.runs
         if "MERGE (entity:Entity" in query
     ]
+
+
+@pytest.fixture(autouse=True)
+def _legacy_extractor(monkeypatch):
+    """Ingestion defaults to the LLM transformer; these tests pin the
+    spaCy validation path explicitly instead of hitting a model."""
+
+    monkeypatch.setenv("GRAPH_EXTRACTION_BACKEND", "spacy")
 
 
 def test_ingestion_rejects_noisy_entities_and_keeps_valid_ones(monkeypatch):
@@ -316,9 +347,9 @@ def test_ingestion_is_idempotent_and_uses_parameterized_cypher(monkeypatch):
         content="Acme Corp. content.",
     )
 
-    # The second ingestion issues the same MERGE statements: no inserts.
+    # Re-ingestion uses idempotent MERGEs plus a scoped refresh.
     assert all(
-        "MERGE" in query
+        "MERGE" in query or "MATCH" in query
         for query, _parameters in driver.session_log.runs
     )
 

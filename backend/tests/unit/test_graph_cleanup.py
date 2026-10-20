@@ -162,6 +162,90 @@ def test_duplicate_spellings_are_planned_for_merge_with_provenance():
     )
 
 
+def test_report_flags_missing_relationship_provenance():
+    snapshot = _snapshot(
+        [
+            _app_document(),
+            _entity("e1", "person:jane doe", "Jane Doe", "PERSON"),
+            _rel("d1", "e1", "MENTIONS"),
+        ]
+    )
+
+    report = graph_cleanup.build_report(snapshot)
+
+    assert report["missing_provenance"]["total"] == 1
+    finding = report["missing_provenance"]["items"][0]
+    assert finding["missing_fields"] == ["document_id", "source_refs"]
+    assert finding["proposed"].startswith("Re-ingest")
+
+
+def test_report_does_not_flag_valid_relationship_provenance():
+    relationship = {
+        **_rel("d1", "e1", "MENTIONS"),
+        "document_id": "doc-1",
+        "page_numbers": [2],
+        "source_refs": ["doc-1#page=2"],
+    }
+    snapshot = _snapshot(
+        [
+            _app_document(),
+            _entity("e1", "person:jane doe", "Jane Doe", "PERSON"),
+            relationship,
+        ]
+    )
+
+    report = graph_cleanup.build_report(snapshot)
+
+    assert report["missing_provenance"]["total"] == 0
+
+
+def test_report_flags_source_references_for_the_wrong_document():
+    snapshot = _snapshot(
+        [
+            _app_document(),
+            _entity("e1", "person:jane doe", "Jane Doe", "PERSON"),
+            _entity("e2", "org:acme corp", "Acme Corp", "ORG"),
+            _rel("d1", "e1", "MENTIONS"),
+            _rel("d1", "e2", "MENTIONS"),
+            {
+                **_rel("e1", "e2", "RELATES_TO"),
+                "document_ids": ["doc-1"],
+                "source_refs": ["another-document#page=2"],
+            },
+        ]
+    )
+
+    report = graph_cleanup.build_report(snapshot)
+
+    findings = report["missing_provenance"]["items"]
+    assert any(
+        item["relationship"] == "RELATES_TO"
+        and item["missing_fields"] == ["source_refs"]
+        for item in findings
+    )
+
+
+def test_report_flags_unsupported_relationship_type_on_owned_entities():
+    snapshot = _snapshot(
+        [
+            _app_document(),
+            _entity("e1", "person:jane doe", "Jane Doe", "PERSON"),
+            _entity("e2", "org:acme corp", "Acme Corp", "ORG"),
+            _rel("d1", "e1", "MENTIONS"),
+            _rel("d1", "e2", "MENTIONS"),
+            _rel("e1", "e2", "ACTED_IN"),
+        ]
+    )
+
+    report = graph_cleanup.build_report(snapshot)
+
+    assert report["unsupported_relationships"]["total"] == 1
+    assert (
+        report["unsupported_relationships"]["items"][0]["relationship"]
+        == "ACTED_IN"
+    )
+
+
 def test_conflicting_labels_for_the_same_name_are_flagged_not_merged():
     snapshot = _snapshot(
         [

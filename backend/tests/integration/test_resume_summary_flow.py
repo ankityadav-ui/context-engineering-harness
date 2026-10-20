@@ -13,12 +13,17 @@ Context Engine, FastAPI routing, and SQLite conversation persistence are
 the real implementations.
 """
 
+import json
+from types import SimpleNamespace
+
 import pymupdf
 import pytest
 
 import app.context_engine.engine as engine_module
 import app.main as main_module
 from app.context_engine import database
+from app.context_engine import summarizer as summarizer_module
+from app.rag import pinecone_service
 from app.rag import document_service, embedding_service
 
 # Fictional resume content. Nothing here belongs to a real person.
@@ -76,9 +81,10 @@ def resume_pipeline(tmp_path, monkeypatch):
         main_module.graph_service, "is_configured", lambda: False
     )
 
-    record = {"embedded": [], "upserted": 0}
+    record = {"embedded": [], "upserted": 0, "units": []}
 
     def fake_embed(content_units):
+        record["units"] = content_units
         record["embedded"] = [
             unit["content"] for unit in content_units
         ]
@@ -93,6 +99,35 @@ def resume_pipeline(tmp_path, monkeypatch):
 
     monkeypatch.setattr(document_service, "embed_content_units", fake_embed)
     monkeypatch.setattr(document_service, "upsert_content_units", fake_upsert)
+
+    def fake_searchable_units(document_id):
+        units = [
+            {
+                "unit_id": unit["id"],
+                "document_id": unit["document_id"],
+                "content_type": unit["content_type"],
+                "page_number": unit.get("page_number"),
+                "content": unit.get("content", ""),
+                "source": unit.get("source", "unknown"),
+            }
+            for unit in record.get("units", [])
+            if unit.get("document_id") == document_id
+            and unit.get("content_type") in {"text", "table"}
+        ]
+        return {
+            "document_id": document_id,
+            "document_found": bool(units),
+            "units": units,
+            "page_count": None,
+            "pages_without_text": [],
+            "units_truncated": False,
+        }
+
+    monkeypatch.setattr(
+        pinecone_service,
+        "get_document_searchable_units",
+        fake_searchable_units,
+    )
 
     record["document_dir"] = document_dir
 
@@ -133,7 +168,7 @@ def resume_app(
 
 
 def upload(client, pdf_path, mask_content="false"):
-    return client.post(
+    accepted = client.post(
         "/documents/upload",
         files={
             "file": (
@@ -144,19 +179,56 @@ def upload(client, pdf_path, mask_content="false"):
         },
         data={"mask_content": mask_content},
     )
+    if accepted.status_code != 202:
+        return accepted
+
+    job = client.get(
+        f"/documents/jobs/{accepted.json()['job_id']}"
+    ).json()
+    if job["status"] != "completed":
+        error_code = (job.get("error") or {}).get("code")
+        return SimpleNamespace(
+            status_code={
+                "invalid_pdf": 400,
+                "no_retrievable_content": 422,
+                "masking_rejected": 422,
+                "embedding_failed": 500,
+            }.get(error_code, 500),
+            text=str(job),
+            json=lambda: {"detail": job["error"]["message"]},
+        )
+    return SimpleNamespace(
+        status_code=200,
+        text=accepted.text,
+        json=lambda: {
+            "document_id": job["document_id"],
+            **job["result"],
+        },
+    )
 
 
 def ask_chat(resume_app, message, document_id, conversation_id=None):
-    """Capture the exact prompt the backend sends to the model."""
+    """Capture the exact source set sent to the document summarizer."""
 
     prompts = []
 
-    def fake_generate_response(prompt, system=None):
+    def fake_generate_response(prompt):
         prompts.append(prompt)
-        return "The model answered from the supplied evidence."
+        sources = json.loads(prompt.split("Sources:\n", 1)[1])
+        first_source = sources[0]
+        return json.dumps(
+            [
+                {
+                    "unit_id": first_source["unit_id"],
+                    "quote": first_source["text"][:400],
+                }
+            ]
+        )
 
     resume_app["monkeypatch"].setattr(
-        main_module, "generate_response", fake_generate_response
+        summarizer_module,
+        "generate_response",
+        fake_generate_response,
     )
 
     payload = {"message": message, "document_id": document_id}
@@ -193,13 +265,12 @@ def test_chat_summarise_this_uses_the_uploaded_resume(tmp_path, resume_app):
     assert response.status_code == 200, response.text
     body = response.json()
 
-    assert "The model answered" in body["response"]
+    assert "Key passages from the selected document" in body["response"]
     assert prompts, "the model must receive an assembled context"
 
     prompt = prompts[-1]
 
-    # The chosen document is the one the user just uploaded, and the
-    # full-text fallback reached the model even with an empty index.
+    # The selected document's page-aware source units reached the model.
     assert document_id in prompt
     assert "Vikram Rathore" in prompt
     assert "Example University" in prompt
@@ -232,6 +303,8 @@ def test_masked_resume_keeps_structure_and_never_leaks_raw_pii(
     assert upload_body["masking_applied"] is True
     assert upload_body["masking_safety_passed"] is True
     assert upload_body["masked_entities"] >= 1
+    assert upload_body["newly_masked_entities"] == upload_body["masked_entities"]
+    assert upload_body["existing_placeholders"] == 0
     assert upload_body["masked_text_stored"] is True
 
     # The raw PDF is gone; only sanitized text remains on disk.
@@ -240,6 +313,10 @@ def test_masked_resume_keeps_structure_and_never_leaks_raw_pii(
         resume_app["document_dir"].glob("*.masked.txt")
     )
     assert len(masked_artifacts) == 1
+    masked_unit_artifacts = list(
+        resume_app["document_dir"].glob("*.masked.units.json")
+    )
+    assert len(masked_unit_artifacts) == 1
 
     document_id = upload_body["document_id"]
 
@@ -273,6 +350,11 @@ def test_masked_resume_keeps_structure_and_never_leaks_raw_pii(
     artifact_text = masked_artifacts[0].read_text(encoding="utf-8")
     assert "Vikram Rathore" not in artifact_text
     assert "vikram.rathore@example.com" not in artifact_text
+    unit_artifact_text = masked_unit_artifacts[0].read_text(
+        encoding="utf-8"
+    )
+    assert "Vikram Rathore" not in unit_artifact_text
+    assert "page_number" in unit_artifact_text
 
 
 def test_upload_succeeds_with_a_realistic_pinecone_client_shape(
@@ -390,6 +472,9 @@ def test_deleting_a_masked_document_removes_its_artifact(
     expected = str(artifacts[0].relative_to(tmp_path)).replace("\\", "/")
     assert expected in [item.replace("\\", "/") for item in removed]
     assert list(resume_app["document_dir"].glob("*.masked.txt")) == []
+    assert list(
+        resume_app["document_dir"].glob("*.masked.units.json")
+    ) == []
 
 
 def test_chat_with_no_retrievable_document_reports_clearly(resume_app):
@@ -397,12 +482,17 @@ def test_chat_with_no_retrievable_document_reports_clearly(resume_app):
 
     prompts = []
 
-    def fake_generate_response(prompt, system=None):
-        prompts.append(prompt)
-        return "This answer should never be generated."
-
     resume_app["monkeypatch"].setattr(
-        main_module, "generate_response", fake_generate_response
+        pinecone_service,
+        "get_document_searchable_units",
+        lambda document_id: {
+            "document_id": document_id,
+            "document_found": False,
+            "units": [],
+            "page_count": None,
+            "pages_without_text": [],
+            "units_truncated": False,
+        },
     )
 
     response = resume_app["client"].post(
@@ -414,7 +504,7 @@ def test_chat_with_no_retrievable_document_reports_clearly(resume_app):
     )
 
     assert response.status_code == 400
-    assert "no retrievable content" in response.json()["detail"].lower()
+    assert "no indexed content" in response.json()["detail"].lower()
     assert prompts == []
 
 

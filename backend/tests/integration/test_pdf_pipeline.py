@@ -10,6 +10,8 @@ No external service is contacted and no real document is used.
 import io
 
 import pymupdf
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -125,7 +127,7 @@ def pipeline(tmp_path, monkeypatch):
 def upload(pdf_path, mask_content="false"):
     with TestClient(app) as client:
         with open(pdf_path, "rb") as handle:
-            return client.post(
+            accepted = client.post(
                 "/documents/upload",
                 files={
                     "file": (
@@ -136,6 +138,26 @@ def upload(pdf_path, mask_content="false"):
                 },
                 data={"mask_content": mask_content},
             )
+        if accepted.status_code != 202:
+            return accepted
+
+        job = client.get(
+            f"/documents/jobs/{accepted.json()['job_id']}"
+        ).json()
+        if job["status"] != "completed":
+            return SimpleNamespace(
+                status_code=500,
+                text=str(job),
+                json=lambda: {"detail": job["error"]["message"]},
+            )
+        return SimpleNamespace(
+            status_code=200,
+            text=accepted.text,
+            json=lambda: {
+                "document_id": job["document_id"],
+                **job["result"],
+            },
+        )
 
 
 def test_real_pdf_is_extracted_embedded_and_indexed(tmp_path, pipeline):

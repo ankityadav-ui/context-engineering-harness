@@ -1,10 +1,12 @@
 
 # Import libraries for environment variables, paths, and Neo4j.
 import os
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 import certifi
 from neo4j import GraphDatabase, TrustCustomCAs
+from collections.abc import Callable
 
 # Graph-specific validation lives outside the masking NER service so
 # improving graph precision can never reduce masking coverage.
@@ -180,65 +182,286 @@ def create_relationship(
         return dict(record)
 
 
-def list_entities(limit: int = 25):
+def list_entities(
+    limit: int = 25,
+    offset: int = 0,
+    entity_type: str | None = None,
+):
     """Return entities from the graph, ordered by name."""
 
     # Keep a single request bounded.
     if not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100.")
 
-    query = """
+    if offset < 0:
+        raise ValueError("offset cannot be negative.")
+
+    entity_filter = (
+        "WHERE entity.entity_type = $entity_type "
+        if entity_type
+        else ""
+    )
+
+    query = f"""
     MATCH (entity:Entity)
+    {entity_filter}
     RETURN
         entity.entity_id AS entity_id,
         entity.name AS name,
         entity.entity_type AS entity_type
     ORDER BY entity.name
+    SKIP $offset
     LIMIT $limit
     """
 
     # Return matching entities as ordinary Python dictionaries.
     with get_driver().session(database=NEO4J_DATABASE) as session:
-        records = session.run(query, limit=limit)
+        params = {"limit": limit, "offset": offset}
+        if entity_type:
+            params["entity_type"] = entity_type.strip().upper()
+        records = session.run(query, **params)
 
         return [dict(record) for record in records]
 
 
-def find_entities(search_text: str):
+def find_entities(
+    search_text: str,
+    limit: int = 20,
+    entity_type: str | None = None,
+    offset: int = 0,
+):
     """Find entities whose names contain the supplied text."""
 
     # Reject empty searches.
     if not search_text or not search_text.strip():
         raise ValueError("Search text cannot be empty.")
 
-    query = """
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100.")
+
+    if offset < 0:
+        raise ValueError("offset cannot be negative.")
+
+    type_filter = (
+        "AND entity.entity_type = $entity_type "
+        if entity_type
+        else ""
+    )
+    offset_clause = "SKIP $offset" if offset else ""
+
+    query = f"""
     MATCH (entity:Entity)
     WHERE toLower(entity.name) CONTAINS toLower($search_text)
+    {type_filter}
     RETURN
         entity.entity_id AS entity_id,
         entity.name AS name,
         entity.entity_type AS entity_type
     ORDER BY entity.name
-    LIMIT 20
+    {offset_clause}
+    LIMIT $limit
     """
 
     # Return matching entities as ordinary Python dictionaries.
     with get_driver().session(database=NEO4J_DATABASE) as session:
+        parameters = {
+            "search_text": search_text.strip(),
+            "limit": limit,
+        }
+        if entity_type:
+            parameters["entity_type"] = entity_type.strip().upper()
+        if offset:
+            parameters["offset"] = offset
         records = session.run(
             query,
-            search_text=search_text.strip(),
+            **parameters,
         )
 
         return [dict(record) for record in records]
 
 
-def get_entity_relationships(entity_id: str):
-    """Return incoming and outgoing relationships for one entity."""
+def graph_counts() -> dict:
+    """Return graph totals and entity-type counts using read-only queries."""
+
+    queries = {
+        "entities": "MATCH (entity:Entity) RETURN count(entity) AS count",
+        "documents": (
+            "MATCH (document:Document) RETURN count(document) AS count"
+        ),
+        "relationships": "MATCH ()-[r]->() RETURN count(r) AS count",
+    }
+
+    with get_driver().session(database=NEO4J_DATABASE) as session:
+        counts = {}
+        for name, query in queries.items():
+            record = session.run(query).single()
+            counts[name] = int(record["count"]) if record else 0
+
+        type_query = """
+        MATCH (entity:Entity)
+        RETURN entity.entity_type AS entity_type, count(entity) AS entities
+        ORDER BY entity_type
+        """
+        type_records = session.run(type_query)
+
+        counts["entity_types"] = [
+            {
+                "entity_type": record["entity_type"],
+                "entities": int(record["entities"]),
+            }
+            for record in type_records
+        ]
+
+    return counts
+
+
+def find_entity_documents(
+    entity_id: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Return documents linked to an entity through MENTIONS edges."""
+
+    if not entity_id or not entity_id.strip():
+        raise ValueError("entity_id cannot be empty.")
+
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100.")
+
+    query = """
+    MATCH (document:Document)-[:MENTIONS]->(entity:Entity {entity_id: $entity_id})
+    RETURN
+        document.document_id AS document_id,
+        document.title AS title,
+        document.source AS source
+    ORDER BY document.title
+    LIMIT $limit
+    """
+
+    with get_driver().session(database=NEO4J_DATABASE) as session:
+        records = session.run(
+            query,
+            entity_id=entity_id.strip(),
+            limit=limit,
+        )
+
+        return [dict(record) for record in records]
+
+
+def get_entity_neighborhood(
+    entity_id: str,
+    limit: int = 25,
+) -> dict:
+    """Return one entity and its bounded incoming/outgoing edges."""
+
+    if not entity_id or not entity_id.strip():
+        raise ValueError("entity_id cannot be empty.")
+
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100.")
+
+    query = """
+    MATCH (center:Entity {entity_id: $entity_id})
+    CALL {
+        WITH center
+        OPTIONAL MATCH (center)-[relationship]->(neighbor:Entity)
+        RETURN collect(
+            CASE WHEN relationship IS NULL THEN null ELSE {
+                entity_id: neighbor.entity_id,
+                name: neighbor.name,
+                entity_type: neighbor.entity_type,
+                relationship: type(relationship)
+            } END
+        )[0..$limit] AS outgoing_edges
+    }
+    CALL {
+        WITH center
+        OPTIONAL MATCH (neighbor:Entity)-[relationship]->(center)
+        RETURN collect(
+            CASE WHEN relationship IS NULL THEN null ELSE {
+                entity_id: neighbor.entity_id,
+                name: neighbor.name,
+                entity_type: neighbor.entity_type,
+                relationship: type(relationship)
+            } END
+        )[0..$limit] AS incoming_edges
+    }
+    RETURN
+        center.entity_id AS center_id,
+        center.name AS center_name,
+        center.entity_type AS center_type,
+        outgoing_edges,
+        incoming_edges
+    """
+
+    with get_driver().session(database=NEO4J_DATABASE) as session:
+        record = session.run(
+            query,
+            entity_id=entity_id.strip(),
+            limit=limit,
+        ).single()
+
+    if record is None:
+        return {"entity": None, "edges": []}
+
+    entity = {
+        "entity_id": record["center_id"],
+        "name": record["center_name"],
+        "entity_type": record["center_type"],
+    }
+    edges = []
+    seen_edges = set()
+
+    for direction, candidates in (
+        ("outgoing", record["outgoing_edges"] or []),
+        ("incoming", record["incoming_edges"] or []),
+    ):
+        for candidate in candidates:
+            if not candidate or not candidate.get("entity_id"):
+                continue
+
+            if direction == "outgoing":
+                edge = {
+                    "source_id": entity["entity_id"],
+                    "source": entity["name"],
+                    "relationship": candidate["relationship"],
+                    "target_id": candidate["entity_id"],
+                    "target": candidate["name"],
+                    "direction": direction,
+                }
+            else:
+                edge = {
+                    "source_id": candidate["entity_id"],
+                    "source": candidate["name"],
+                    "relationship": candidate["relationship"],
+                    "target_id": entity["entity_id"],
+                    "target": entity["name"],
+                    "direction": direction,
+                }
+
+            key = (
+                edge["source_id"],
+                edge["relationship"],
+                edge["target_id"],
+            )
+            if key not in seen_edges:
+                seen_edges.add(key)
+                edges.append(edge)
+
+    return {"entity": entity, "edges": edges}
+
+
+def get_entity_relationships(
+    entity_id: str,
+    document_id: str | None = None,
+):
+    """Return entity relationships, optionally limited to one document."""
 
     query = """
     MATCH (entity:Entity {entity_id: $entity_id})
 
     OPTIONAL MATCH (entity)-[outgoing]->(target:Entity)
+    WHERE $document_id IS NULL
+       OR $document_id IN coalesce(outgoing.document_ids, [])
     WITH entity,
          collect(
              CASE
@@ -253,6 +476,8 @@ def get_entity_relationships(entity_id: str):
          ) AS outgoing_relationships
 
     OPTIONAL MATCH (source:Entity)-[incoming]->(entity)
+    WHERE $document_id IS NULL
+       OR $document_id IN coalesce(incoming.document_ids, [])
     WITH outgoing_relationships,
          collect(
              CASE
@@ -274,6 +499,7 @@ def get_entity_relationships(entity_id: str):
         record = session.run(
             query,
             entity_id=entity_id,
+            document_id=document_id,
         ).single()
 
         # Return an empty list when the entity does not exist.
@@ -418,55 +644,73 @@ def link_document_entity(
         return dict(record)
 
 
-def ingest_document_graph(
-    document_id: str,
-    title: str,
+def _spacy_extraction(
     content: str,
-    case: str | None = None,
-) -> dict:
-    """Ingest a document and its entities into the Neo4j knowledge graph.
+    *,
+    document_id: str,
+    pages: list[dict] | None = None,
+):
+    """Original spaCy NER extraction, kept as an explicit opt-in path.
 
-    Supported entities are extracted with the shared spaCy NER loader,
-    filtered with graph-specific quality checks, and linked to the document.
-    Entity pairs found in the same sentence receive RELATES_TO edges.
+    Only selected via ``extractor="spacy"`` or
+    ``GRAPH_EXTRACTION_BACKEND=spacy``; it is never chosen silently.
     """
-    if not content or not content.strip():
-        raise ValueError("Document content is empty; nothing to ingest.")
 
-    # 1. Create or reuse the document and optional case node.
-    create_document_node(
-        document_id=document_id,
-        title=title,
-        source="document-upload",
-        case_id=case,
+    from app.context_engine.llm_graph_transformer import (
+        ExtractedNode,
+        ExtractedRelationship,
+        ExtractionResult,
+        _relationship_evidence_is_supported,
+        build_entity_id,
     )
-
-    # 2. Extract entities with the shared spaCy NER loader. Detection is
-    # shared with masking; only the validation below is graph-specific.
     from app.masking.ner_service import get_nlp
 
-    doc = get_nlp()(content[:20000])
+    source_units = [
+        page
+        for page in (pages or [])
+        if str(page.get("content") or "").strip()
+    ]
+    if not source_units:
+        source_units = [{"content": content}]
 
-    # Phase 1: collect raw candidates, preserving sentence boundaries.
-    raw_sentences: list[list[tuple[str, str]]] = []
+    raw_sentences: list[dict] = []
 
-    for sentence in doc.sents:
-        candidates: list[tuple[str, str]] = []
+    for unit in source_units:
+        page_number = unit.get("page_number")
+        source_unit_id = unit.get("source_unit_id")
+        source_text = str(unit.get("content") or "")[:20000]
+        source_ref = (
+            f"{document_id}#page={page_number}#unit={source_unit_id}"
+            if page_number is not None and source_unit_id
+            else (
+                f"{document_id}#page={page_number}"
+                if page_number is not None
+                else document_id
+            )
+        )
+        doc = get_nlp()(source_text)
 
-        for entity in sentence.ents:
-            # Keep only categories supported by the graph.
-            if entity.label_ not in _ENTITY_LABELS:
-                continue
+        # Keep each sentence and its source-unit metadata together.
+        for sentence in doc.sents:
+            candidates: list[tuple[str, str]] = []
 
-            name = normalize_entity_name(entity.text)
+            for entity in sentence.ents:
+                if entity.label_ not in _ENTITY_LABELS:
+                    continue
 
-            # Name-quality validation (placeholders, OCR debris, etc.).
-            if not is_usable_entity_name(name):
-                continue
+                name = normalize_entity_name(entity.text)
+                if is_usable_entity_name(name):
+                    candidates.append((name, entity.label_))
 
-            candidates.append((name, entity.label_))
-
-        raw_sentences.append(candidates)
+            raw_sentences.append(
+                {
+                    "text": str(getattr(sentence, "text", "") or ""),
+                    "source_text": source_text,
+                    "page_number": page_number,
+                    "source_ref": source_ref,
+                    "candidates": candidates,
+                }
+            )
 
     # Phase 2: resolve one type per name across the whole document, then
     # validate the resolved type. Contradictory labels for the same name
@@ -475,8 +719,8 @@ def ingest_document_graph(
     resolved = resolve_entity_types(
         [
             candidate
-            for candidates in raw_sentences
-            for candidate in candidates
+            for sentence in raw_sentences
+            for candidate in sentence["candidates"]
         ]
     )
 
@@ -486,95 +730,477 @@ def ingest_document_graph(
         if is_plausible_entity(entry["name"], entry["entity_type"])
     }
 
-    # Phase 3: build per-sentence entity ids for relationship extraction.
-    seen_entities: dict[str, str] = {}
-    sentences_entities: list[list[str]] = []
+    # Build entities and candidate pairs per sentence.
+    nodes: dict[str, ExtractedNode] = {}
+    sentence_entities: list[tuple[dict, list[str]]] = []
 
-    for candidates in raw_sentences:
+    for sentence in raw_sentences:
         sentence_ids: list[str] = []
 
-        for name, _label in candidates:
+        for name, _label in sentence["candidates"]:
             entry = accepted.get(entity_name_key(name))
 
             if entry is None:
                 continue
 
-            entity_id = _entity_node_id(
+            entity_id = build_entity_id(
                 entry["entity_type"],
                 entry["name"],
             )
 
-            seen_entities.setdefault(entity_id, entry["name"])
+            node = nodes.get(entity_id)
+            if node is None:
+                node = ExtractedNode(
+                    entity_id=entity_id,
+                    name=entry["name"],
+                    entity_type=entry["entity_type"],
+                )
+                nodes[entity_id] = node
+
+            if sentence["page_number"] is not None:
+                node.page_numbers.append(sentence["page_number"])
+            if sentence["source_ref"] not in node.source_refs:
+                node.source_refs.append(sentence["source_ref"])
 
             if entity_id not in sentence_ids:
                 sentence_ids.append(entity_id)
 
-        sentences_entities.append(sentence_ids)
+        sentence_entities.append((sentence, sentence_ids))
 
-    # Limit the number of entities stored for one document.
-    capped_entities = dict(
-        list(seen_entities.items())[:MAX_ENTITIES_PER_DOCUMENT]
+    # Co-occurrence alone is not a relationship. Only create a generic edge
+    # when the sentence contains both entities and an explicit relation cue.
+    relationships: dict[tuple[str, str, str], ExtractedRelationship] = {}
+    dropped = []
+
+    for sentence, sentence_ids in sentence_entities:
+        for index, source_id in enumerate(sentence_ids):
+            for target_id in sentence_ids[index + 1:]:
+                if source_id == target_id:
+                    continue
+
+                source_node = nodes[source_id]
+                target_node = nodes[target_id]
+                evidence = sentence["text"]
+                if not _relationship_evidence_is_supported(
+                    "RELATES_TO",
+                    evidence,
+                    source_node.name,
+                    target_node.name,
+                    sentence["source_text"],
+                ):
+                    dropped.append(
+                        {
+                            "name": (
+                                f"{source_node.name}->{target_node.name}"
+                            ),
+                            "reason": "unsupported_relationship_evidence",
+                        }
+                    )
+                    continue
+
+                key = (source_id, target_id, "RELATES_TO")
+                relationship = relationships.get(key)
+                if relationship is None:
+                    relationship = ExtractedRelationship(
+                        source_id=source_id,
+                        target_id=target_id,
+                        relationship_type="RELATES_TO",
+                    )
+                    relationships[key] = relationship
+                if sentence["page_number"] is not None:
+                    relationship.page_numbers.append(
+                        sentence["page_number"]
+                    )
+                if sentence["source_ref"] not in relationship.source_refs:
+                    relationship.source_refs.append(sentence["source_ref"])
+
+    for node in nodes.values():
+        node.document_id = document_id
+        node.page_numbers = sorted(set(node.page_numbers))
+
+    for relationship in relationships.values():
+        relationship.document_id = document_id
+        relationship.page_numbers = sorted(set(relationship.page_numbers))
+
+    return ExtractionResult(
+        nodes=list(nodes.values()),
+        relationships=list(relationships.values()),
+        dropped=dropped,
+        backend="spacy",
     )
 
-    # 3. Create/reuse entity nodes and link them to the document.
+
+def _resolve_extraction_backend(extractor: str | None) -> str:
+    """Pick the extraction backend, reporting rather than guessing."""
+
+    from app.context_engine import llm_graph_transformer
+
+    if extractor:
+        selected = extractor.strip().casefold()
+    elif llm_graph_transformer.llm_extraction_enabled():
+        selected = "llm"
+    else:
+        selected = "spacy"
+
+    if selected not in {"llm", "spacy"}:
+        raise ValueError(f"Unsupported graph extractor: {extractor}")
+
+    return selected
+
+
+def ingest_document_graph(
+    document_id: str,
+    title: str,
+    content: str,
+    case: str | None = None,
+    pages: list[dict] | None = None,
+    extractor: str | None = None,
+    transformer=None,
+    on_stage: Callable[[str, str, float, str | None], None] | None = None,
+) -> dict:
+    """Ingest a document and its entities into the Neo4j knowledge graph.
+
+    Entities are extracted with LangChain's LLMGraphTransformer by default
+    (see ``llm_graph_transformer``), validated and deduplicated before any
+    write, then merged into Neo4j together with their page provenance.
+
+    ``extractor="spacy"`` selects the legacy NER path explicitly; it is
+    never used silently when the LLM path is the configured one.
+    """
+    if not content or not content.strip():
+        raise ValueError("Document content is empty; nothing to ingest.")
+
+    # Extract + validate before opening a write transaction. A model or
+    # validation failure must not leave a partial Document node behind.
+    backend = _resolve_extraction_backend(extractor)
+
+    extraction_started = time.perf_counter()
+    if on_stage is not None:
+        on_stage("graph_extraction", "running", 0.0, None)
+    try:
+        if backend == "spacy":
+            extraction = _spacy_extraction(
+                content,
+                document_id=document_id,
+                pages=pages,
+            )
+        else:
+            from app.context_engine.llm_graph_transformer import extract_graph
+
+            extraction = extract_graph(
+                content,
+                document_id=document_id,
+                transformer=transformer,
+                pages=pages,
+            )
+    except Exception as error:
+        if on_stage is not None:
+            on_stage(
+                "graph_extraction",
+                "failed",
+                (time.perf_counter() - extraction_started) * 1000,
+                type(error).__name__,
+            )
+        raise
+    if on_stage is not None:
+        on_stage(
+            "graph_extraction",
+            "completed",
+            (time.perf_counter() - extraction_started) * 1000,
+            None,
+        )
+
+    # Limit the number of entities/relationships stored for one document.
+    accepted_nodes = extraction.nodes[:MAX_ENTITIES_PER_DOCUMENT]
+    accepted_ids = {node.entity_id for node in accepted_nodes}
+
+    accepted_relationships = [
+        relationship
+        for relationship in extraction.relationships
+        if relationship.source_id in accepted_ids
+        and relationship.target_id in accepted_ids
+    ][:MAX_RELATIONS_PER_DOCUMENT]
+
+    # 3. Create/reuse entity nodes, linking each to the document.
+    # The document link carries page and source-reference provenance.
     entity_upsert = """
     MERGE (entity:Entity {entity_id: $entity_id})
-    SET entity.name = $name,
+    ON CREATE SET
+        entity.name = $name,
+        entity.canonical_name = $name,
+        entity.aliases = [],
         entity.entity_type = $entity_type
+    ON MATCH SET
+        entity.canonical_name = coalesce(
+            entity.canonical_name,
+            entity.name,
+            $name
+        ),
+        entity.aliases = CASE
+            WHEN $name = coalesce(entity.canonical_name, entity.name)
+              OR $name IN coalesce(entity.aliases, [])
+            THEN coalesce(entity.aliases, [])
+            ELSE coalesce(entity.aliases, []) + [$name]
+        END
     WITH entity
+    WHERE entity.entity_type = $entity_type
     MATCH (document:Document {document_id: $document_id})
-    MERGE (document)-[:MENTIONS]->(entity)
+    MERGE (document)-[mention:MENTIONS]->(entity)
+    SET mention.document_id = $document_id,
+        mention.page_numbers = $page_numbers,
+        mention.source_refs = $source_refs
     RETURN entity.entity_id AS entity_id
     """
 
-    with get_driver().session(database=NEO4J_DATABASE) as session:
-        created_entities = 0
+    relationship_upsert = """
+    MATCH (source:Entity {entity_id: $source_id})
+    MATCH (target:Entity {entity_id: $target_id})
+    {relationship_merge}
+    SET relationship.document_ids = reduce(
+                unique_values = [],
+                value IN coalesce(relationship.document_ids, []) + [$document_id] |
+                CASE
+                    WHEN value IN unique_values THEN unique_values
+                    ELSE unique_values + [value]
+                END
+        ),
+        relationship.source_refs = reduce(
+                unique_values = [],
+                value IN coalesce(relationship.source_refs, []) + $source_refs |
+                CASE
+                    WHEN value IN unique_values THEN unique_values
+                    ELSE unique_values + [value]
+                END
+        ),
+        relationship.page_numbers = reduce(
+                unique_values = [],
+                value IN coalesce(relationship.page_numbers, []) + $page_numbers |
+                CASE
+                    WHEN value IN unique_values THEN unique_values
+                    ELSE unique_values + [value]
+                END
+        )
+    RETURN source.entity_id AS source_id
+    """
 
-        for entity_id, name in capped_entities.items():
-            entity_type = entity_id.split(":", 1)[0].upper()
-            session.run(
-                entity_upsert,
-                entity_id=entity_id,
-                name=name,
-                entity_type=entity_type,
-                document_id=document_id,
+    document_upsert = """
+    MERGE (document:Document {document_id: $document_id})
+    SET document.title = $title,
+        document.source = $source
+    WITH document
+    FOREACH (_ IN CASE WHEN $case_id IS NULL THEN [] ELSE [1] END |
+        MERGE (case_node:Case {case_id: $case_id})
+        ON CREATE SET case_node.name = $case_id
+        MERGE (document)-[:PART_OF]->(case_node)
+    )
+    RETURN document.document_id AS document_id
+    """
+    stale_mentions = """
+    MATCH (document:Document {document_id: $document_id})
+          -[mention:MENTIONS]->(entity:Entity)
+    WITH collect(mention) AS mentions,
+         collect(entity.entity_id) AS entity_ids
+    FOREACH (mention IN mentions | DELETE mention)
+    RETURN entity_ids
+    """
+    stale_orphan_entities = """
+    UNWIND $entity_ids AS entity_id
+    MATCH (entity:Entity {entity_id: entity_id})
+    OPTIONAL MATCH (entity)-[relationship]-()
+    WITH entity, count(relationship) AS relationship_count
+    WHERE relationship_count = 0
+    DELETE entity
+    """
+    stale_relationships = """
+    MATCH (:Entity)-[relationship]->(:Entity)
+    WHERE $document_id IN coalesce(relationship.document_ids, [])
+    WITH relationship,
+         [value IN coalesce(relationship.document_ids, [])
+          WHERE value <> $document_id] AS remaining_document_ids,
+         [ref IN coalesce(relationship.source_refs, [])
+          WHERE ref <> $document_id
+            AND NOT ref STARTS WITH $document_id + "#page="]
+             AS remaining_source_refs
+    WITH relationship, remaining_document_ids, remaining_source_refs,
+         [ref IN remaining_source_refs
+          WHERE ref CONTAINS "#page="
+          | toInteger(split(split(ref, "#page=")[1], "#")[0])]
+             AS remaining_page_numbers
+    FOREACH (_ IN CASE WHEN size(remaining_document_ids) = 0
+                       THEN [1] ELSE [] END |
+        DELETE relationship
+    )
+    FOREACH (_ IN CASE WHEN size(remaining_document_ids) > 0
+                       THEN [1] ELSE [] END |
+        SET relationship.document_ids = remaining_document_ids,
+            relationship.source_refs = remaining_source_refs,
+            relationship.page_numbers = reduce(
+                pages = [],
+                page IN remaining_page_numbers |
+                    CASE
+                        WHEN page IN pages THEN pages
+                        ELSE pages + [page]
+                    END
             )
-            created_entities += 1
+    )
+    """
 
-        # 4. Link entity pairs that occur in the same sentence.
+    def write_transaction(transaction):
+        created_entities = 0
         created_relations = 0
 
-        for sentence_ids in sentences_entities:
-            for index, source_id in enumerate(sentence_ids):
-                for target_id in sentence_ids[index + 1:]:
-                    # Only create relationships for retained entities.
-                    if (
-                        source_id not in capped_entities
-                        or target_id not in capped_entities
-                    ):
-                        continue
+        document_record = transaction.run(
+            document_upsert,
+            document_id=document_id,
+            title=title,
+            source="document-upload",
+            case_id=case,
+        ).single()
+        if document_record is None:
+            raise RuntimeError("The graph document could not be created.")
 
-                    session.run(
-                        "MATCH (source:Entity {entity_id: $source_id}) "
-                        "MATCH (target:Entity {entity_id: $target_id}) "
-                        "MERGE (source)-[:RELATES_TO]->(target)",
-                        source_id=source_id,
-                        target_id=target_id,
-                    )
-                    created_relations += 1
+        # Refresh only edges owned by this document. Shared entity nodes
+        # and relationships from other documents remain untouched.
+        stale_mention_record = transaction.run(
+            stale_mentions,
+            document_id=document_id,
+        ).single()
+        stale_entity_ids = (
+            stale_mention_record.get("entity_ids", [])
+            if stale_mention_record is not None
+            else []
+        )
+        transaction.run(stale_relationships, document_id=document_id)
+        transaction.run(
+            stale_orphan_entities,
+            entity_ids=[
+                entity_id
+                for entity_id in stale_entity_ids
+                if entity_id not in accepted_ids
+            ],
+        )
 
-                    if created_relations >= MAX_RELATIONS_PER_DOCUMENT:
-                        break
-                if created_relations >= MAX_RELATIONS_PER_DOCUMENT:
-                    break
-            if created_relations >= MAX_RELATIONS_PER_DOCUMENT:
-                break
+        for node in accepted_nodes:
+            record = transaction.run(
+                entity_upsert,
+                entity_id=node.entity_id,
+                name=node.name,
+                entity_type=node.entity_type,
+                document_id=document_id,
+                page_numbers=list(node.page_numbers),
+                source_refs=list(node.source_refs),
+            ).single()
+            if record is None:
+                raise RuntimeError(
+                    "Graph entity type conflicts with its stable entity id."
+                )
+            created_entities += 1
+
+        for relationship in accepted_relationships:
+            if relationship.relationship_type not in ALLOWED_RELATIONSHIPS:
+                raise ValueError(
+                    "Unsupported relationship type in validated graph."
+                )
+
+            merge_query = (
+                "MERGE (source)-[relationship:"
+                f"{relationship.relationship_type}]->(target)"
+            )
+            transaction.run(
+                relationship_upsert.replace(
+                    "{relationship_merge}", merge_query
+                ),
+                source_id=relationship.source_id,
+                target_id=relationship.target_id,
+                document_id=document_id,
+                page_numbers=list(relationship.page_numbers),
+                source_refs=list(relationship.source_refs),
+            )
+            created_relations += 1
+
+        return created_entities, created_relations
+
+    persistence_started = time.perf_counter()
+    if on_stage is not None:
+        on_stage("neo4j_persistence", "running", 0.0, None)
+    try:
+        with get_driver().session(database=NEO4J_DATABASE) as session:
+            created_entities, created_relations = session.execute_write(
+                write_transaction
+            )
+    except Exception as error:
+        if on_stage is not None:
+            on_stage(
+                "neo4j_persistence",
+                "failed",
+                (time.perf_counter() - persistence_started) * 1000,
+                type(error).__name__,
+            )
+        raise
+    if on_stage is not None:
+        on_stage(
+            "neo4j_persistence",
+            "completed",
+            (time.perf_counter() - persistence_started) * 1000,
+            None,
+        )
 
     return {
         "document_id": document_id,
         "entities_ingested": created_entities,
         "entity_relations_ingested": created_relations,
         "case": case,
+        "extraction_backend": extraction.backend,
+        "extraction_provider": extraction.provider or extraction.backend,
+        "entities_dropped": len(extraction.dropped),
+    }
+
+
+def find_document_graph(document_id: str, limit: int = 200) -> dict:
+    """Return a document's graph: its entities and the edges between them.
+
+    Only relationships whose source and target are both mentioned by
+    the same document are returned, so the view never pulls in another
+    document's subgraph. Read-only: MATCH/RETURN only.
+    """
+
+    if not document_id.strip():
+        raise ValueError("document_id cannot be empty.")
+
+    if not 1 <= limit <= 500:
+        raise ValueError("limit must be between 1 and 500.")
+
+    entities = find_document_entities(document_id)
+
+    edge_query = """
+    MATCH (document:Document {document_id: $document_id})
+          -[:MENTIONS]->(source:Entity)
+    MATCH (source)-[relationship]->(target:Entity)
+    MATCH (document)-[:MENTIONS]->(target)
+    WHERE $document_id IN coalesce(relationship.document_ids, [])
+    RETURN
+        source.entity_id AS source_id,
+        source.name AS source,
+        type(relationship) AS relationship,
+        target.entity_id AS target_id,
+        target.name AS target
+    ORDER BY source.name, target.name
+    LIMIT $limit
+    """
+
+    with get_driver().session(database=NEO4J_DATABASE) as session:
+        records = session.run(
+            edge_query,
+            document_id=document_id.strip(),
+            limit=limit,
+        )
+
+        edges = [dict(record) for record in records]
+
+    return {
+        "document_id": document_id.strip(),
+        "entities": entities,
+        "edges": edges,
     }
 
 

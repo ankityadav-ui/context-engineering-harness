@@ -136,6 +136,16 @@ def is_pdf_openable(document_path) -> bool:
         document.close()
 
 
+def get_pdf_page_count(document_path) -> int:
+    """Return the number of pages in a validated PDF."""
+
+    document = _open_pdf_document(document_path)
+    try:
+        return document.page_count
+    finally:
+        document.close()
+
+
 def _page_has_meaningful_text(page) -> bool:
     try:
         text = page.get_text("text") or ""

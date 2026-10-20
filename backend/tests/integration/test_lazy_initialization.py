@@ -60,10 +60,10 @@ def test_importing_function_modules_does_not_connect():
     # load_dotenv() cannot repopulate them (empty values are respected).
     env = os.environ.copy()
     env["PYTHONPATH"] = str(BACKEND_DIR)
-    env["LLM_PROVIDER"] = "ollama"
+    env["GEMINI_API_KEY"] = "test-gemini-key"
+    env["GEMINI_TEXT_MODEL"] = "gemini-test-model"
     for key in (
         "PINECONE_API_KEY",
-        "GEMINI_API_KEY",
         "DATABASE_URL",
         "NEO4J_URI",
         "NEO4J_PASSWORD",

@@ -1,462 +1,465 @@
-# Tests for the single-backend LLM module.
-#
-# External services (Gemini API, Ollama) are mocked: no network calls.
+"""Tests for the shared Gemini generation layer.
+
+All provider calls are mocked; these tests do not access external services.
+"""
+
+import base64
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 import app.llm as llm
 
 
-class FakeUsageMetadata:
-    def __init__(self, prompt=10, candidates=5, total=15):
-        self.prompt_eval_count = prompt
-        self.eval_count = candidates
-        self.total_token_count = total
-
-
 class FakeMessage:
-    """Minimal stand-in for an ollama message."""
-
-    def __init__(self, content):
+    def __init__(self, content, usage_metadata=None):
         self.content = content
+        self.usage_metadata = usage_metadata
 
 
-class FakeResponse:
-    """Minimal stand-in for an ollama ChatResponse."""
+class FakeChatModel:
+    def __init__(self, response=None, chunks=(), error=None):
+        self.response = response or FakeMessage("ok")
+        self.chunks = list(chunks)
+        self.error = error
+        self.invocations = []
+        self.streamed = []
 
-    def __init__(self, content="ok", usage=None):
-        self.message = FakeMessage(content)
-        self.usage = usage
+    def invoke(self, messages):
+        self.invocations.append(messages)
+        if self.error:
+            raise self.error
+        return self.response
 
-
-class FakeUsage:
-    """Minimal stand-in for an ollama usage object."""
-
-    def __init__(self, prompt=10, candidates=5, total=15):
-        self.prompt_eval_count = prompt
-        self.eval_count = candidates
-        self.total_token_count = total
+    def stream(self, messages):
+        self.streamed.append(messages)
+        if self.error:
+            raise self.error
+        yield from self.chunks
 
 
 @pytest.fixture(autouse=True)
-def _frozen_config(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setenv("GEMINI_TEXT_MODEL", "gemma-4-31b-it")
-
-    # Startup-validation results are cached per configuration in the
-    # module; clear them so tests stay independent of each other.
-    llm.reset_validation_cache()
-
+def _configured_gemini(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-key")
+    monkeypatch.setenv("GEMINI_TEXT_MODEL", "gemini-test-model")
+    monkeypatch.delenv("GEMINI_TIMEOUT_SECONDS", raising=False)
+    llm.reset_client()
     yield
-
-    llm._client = None
-    llm._probe_client = None
-    llm.reset_validation_cache()
-    llm._last_request.update({"duration_ms": None, "usage": None})
+    llm.reset_client()
 
 
-def _client_with(chat=lambda **kwargs: FakeResponse(FakeMessage("ok"))):
-    """Install a fake ollama.Client with a single chat() call.
-
-    Mirrors the real ollama SDK contract: chat() returns one object
-    with a ``message`` and an optional usage payload, and streaming
-    chat() returns an iterable of those objects.
-    """
-
-    class _FakeMessage:
-        def __init__(self, content):
-            self.content = content
-
-    class _FakeUsage:
-        def __init__(self, prompt=10, candidates=5):
-            self.prompt_eval_count = prompt
-            self.eval_count = candidates
-
-    class _FakeResponse:
-        def __init__(self, content="ok", usage=None):
-            self.message = _FakeMessage(content)
-            self.usage = usage
-
-    class _FakeClient:
-        def chat(self, **kwargs):
-            return chat(**kwargs)
-
-        def list(self):
-            return [_FakeModel()]
-
-        def show(self, model=None):
-            return _FakeShow()
-
-        def close(self):
-            pass
-
-    llm._client = _FakeClient()
-    return llm._client
-
-
-class _FakeModel:
-    name = "models/gemma4:31b"
-
-
-class _FakeShow:
-    def __init__(self):
-        self.capabilities = ["vision"]
-
-
-# --------------------------------------------------
-# Text generation
-# --------------------------------------------------
-
-def test_generate_response_returns_text_and_metadata():
-    _client_with(
-        chat=lambda **kwargs: FakeResponse(
-            content="hello there",
-            usage=FakeUsage(prompt=10, candidates=5),
+def test_generate_response_sends_system_and_user_and_records_usage(monkeypatch):
+    model = FakeChatModel(
+        FakeMessage(
+            "hello there",
+            {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
         )
     )
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
 
-    answer = llm.generate_response("prompt text")
+    assert llm.generate_response("prompt text", system="Be concise") == "hello there"
+    messages = model.invocations[0]
+    assert [message.type for message in messages] == ["system", "human"]
+    assert messages[0].content == "Be concise"
+    assert messages[1].content == "prompt text"
+    assert llm.get_last_request_metadata()["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+    }
 
-    assert answer == "hello there"
 
-    metadata = llm.get_last_request_metadata()
-
-    assert metadata["usage"]["input_tokens"] == 10
-    assert metadata["usage"]["output_tokens"] == 5
-    assert metadata["duration_ms"] is not None
-
-
-def test_generate_response_without_usage_records_none():
-    llm._client = _client_with(
-        chat=lambda **kwargs: FakeResponse(content="hi", usage=None)
+def test_generate_response_without_usage_records_none(monkeypatch):
+    monkeypatch.setattr(
+        llm,
+        "get_chat_model",
+        lambda: FakeChatModel(FakeMessage("hi")),
     )
 
-    llm.generate_response("p")
-
+    assert llm.generate_response("prompt") == "hi"
     assert llm.get_last_request_metadata()["usage"] is None
 
 
-def test_generate_response_empty_text_raises_llm_error():
-    llm._client = _client_with(
-        chat=lambda **kwargs: FakeResponse(content="", usage=None)
+def test_generate_response_normalizes_masked_tokens(monkeypatch):
+    monkeypatch.setattr(
+        llm,
+        "get_chat_model",
+        lambda: FakeChatModel(FakeMessage("Contact [PERSON_5] at [EMAIL_1].")),
     )
 
+    assert llm.generate_response("prompt") == (
+        "Contact Person E at Email address A."
+    )
+
+
+def test_generate_response_rejects_empty_result_and_blank_prompt(monkeypatch):
+    monkeypatch.setattr(
+        llm,
+        "get_chat_model",
+        lambda: FakeChatModel(FakeMessage("  ")),
+    )
     with pytest.raises(llm.LLMError, match="empty response"):
-        llm.generate_response("p")
+        llm.generate_response("prompt")
+
+    with pytest.raises(ValueError, match="Prompt cannot be empty"):
+        llm.generate_response(" ")
 
 
-def test_generate_response_transport_error_raises_llm_error():
-    def _boom(**kwargs):
-        raise ConnectionError("down")
+def test_provider_failures_are_actionable_and_do_not_leak(monkeypatch):
+    class QuotaError(RuntimeError):
+        status_code = 429
 
-    llm._client = _client_with(chat=_boom)
+    model = FakeChatModel(error=QuotaError("private-key quota details"))
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
 
-    with pytest.raises(llm.LLMError, match="Text generation failed"):
-        llm.generate_response("p")
-
-
-def test_generate_response_blank_prompt_rejected():
-    with pytest.raises(ValueError):
-        llm.generate_response("   ")
+    with pytest.raises(llm.LLMError, match="quota or rate limit") as caught:
+        llm.generate_response("prompt")
+    assert "private-key" not in str(caught.value)
 
 
-# --------------------------------------------------
-# Streaming
-# --------------------------------------------------
+def test_quota_503_retries_with_a_bound_and_succeeds(monkeypatch):
+    class QuotaUnavailable(RuntimeError):
+        status_code = 503
 
-def test_stream_yields_text_deltas_and_final_usage():
-    chunks = [
-        FakeResponse(content="hel"),
-        FakeResponse(
-            content="lo ",
-            usage=FakeUsage(prompt=20, candidates=8),
-        ),
-    ]
+    class EventuallyAvailable:
+        def __init__(self):
+            self.calls = 0
 
-    def stream_factory(**kwargs):
-        return iter(chunks)
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls < 3:
+                raise QuotaUnavailable("private quota detail")
+            return FakeMessage("recovered")
 
-    class _FakeClient:
-        def chat(self, **kwargs):
-            return stream_factory(**kwargs)
+    model = EventuallyAvailable()
+    delays = []
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
+    monkeypatch.setattr(llm.time, "sleep", delays.append)
+    monkeypatch.setattr(llm.random, "uniform", lambda low, _high: low)
 
-        def list(self):
-            return [_FakeModel()]
+    assert llm.generate_response("prompt") == "recovered"
+    assert model.calls == 3
+    assert len(delays) == 2
+    assert sum(delays) <= llm.MAX_RETRY_ELAPSED_SECONDS
 
-        def show(self, model=None):
-            return _FakeShow()
 
-        def close(self):
-            pass
+def test_retry_after_beyond_limit_stops_without_sleep(monkeypatch):
+    class DelayedQuotaError(RuntimeError):
+        status_code = 503
+        retry_after = 60
 
-    llm._client = _FakeClient()
+    class AlwaysUnavailable:
+        calls = 0
 
-    deltas = list(llm.stream_response("p"))
+        def invoke(self, _messages):
+            self.calls += 1
+            raise DelayedQuotaError("quota")
 
-    assert "".join(deltas) == "hello "
+    model = AlwaysUnavailable()
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
+    monkeypatch.setattr(
+        llm.time,
+        "sleep",
+        lambda _delay: pytest.fail("over-limit Retry-After must not sleep"),
+    )
 
+    with pytest.raises(llm.LLMError) as caught:
+        llm.generate_response("prompt")
+    assert caught.value.code == "gemini_quota_exhausted"
+    assert model.calls == 1
+
+
+def test_ollama_is_used_only_after_quota_and_only_when_enabled(monkeypatch):
+    class QuotaError(RuntimeError):
+        status_code = 429
+
+    class GeminiUnavailable:
+        def invoke(self, _messages):
+            raise QuotaError("quota")
+
+    class LocalModel:
+        def __init__(self):
+            self.messages = None
+
+        def invoke(self, messages):
+            self.messages = messages
+            return FakeMessage("local answer")
+
+    monkeypatch.setattr(llm, "get_chat_model", GeminiUnavailable)
+    monkeypatch.setattr(llm.time, "sleep", lambda _delay: None)
+    local = LocalModel()
+    monkeypatch.delenv("LLM_QUOTA_FALLBACK", raising=False)
+
+    with pytest.raises(llm.LLMError) as disabled:
+        llm.generate_response("prompt")
+    assert disabled.value.code == "gemini_quota_exhausted"
+    assert "private" not in str(disabled.value)
+
+    monkeypatch.setenv("LLM_QUOTA_FALLBACK", "ollama")
+    monkeypatch.setenv("OLLAMA_TEXT_MODEL", "local-test-model")
+    monkeypatch.setattr(llm, "_configured_ollama_model", lambda: local)
+    assert llm.generate_response("prompt", system="Be concise") == "local answer"
+    assert [message.type for message in local.messages] == ["system", "human"]
     metadata = llm.get_last_request_metadata()
+    assert metadata["provider"] == "ollama"
+    assert metadata["model"] == "local-test-model"
 
-    assert metadata["usage"]["input_tokens"] == 20
-    assert metadata["usage"]["output_tokens"] == 8
 
-
-def test_stream_empty_raises_llm_error():
-    class _FakeClient:
-        def chat(self, **kwargs):
-            return iter([])
-
-        def list(self):
-            return [_FakeModel()]
-
-        def show(self, model=None):
-            return _FakeShow()
-
-        def close(self):
-            pass
-
-    llm._client = _FakeClient()
-
-    with pytest.raises(llm.LLMError, match="empty response"):
-        list(llm.stream_response("p"))
-
-
-# --------------------------------------------------
-# Multimodal (local Ollama vision model)
-# --------------------------------------------------
-
-def test_multimodal_requires_existing_image(tmp_path):
-    with pytest.raises(ValueError):
-        llm.generate_multimodal_response(
-            "describe", [str(tmp_path / "missing.png")]
-        )
-
-
-def test_multimodal_uses_ollama_vision_model(tmp_path, monkeypatch):
-    image = tmp_path / "page_1.png"
-
-    image.write_bytes(b"png")
-
-    captured = {}
-
-    def fake_chat(**kwargs):
-        captured.update(kwargs)
-        response = type("FakeResponse", (), {})()
-        response.message = type("FakeMessage", (), {})()
-        response.message.content = "a chart"
-        return response
-
-    class _FakeClient:
-        def chat(self, **kwargs):
-            return fake_chat(**kwargs)
-
-        def list(self):
-            return [_FakeModel()]
-
-        def show(self, model=None):
-            return _FakeShow()
-
-        def close(self):
-            pass
-
-    llm.reset_client()
-    llm._client = _FakeClient()
-
-    monkeypatch.setenv("OLLAMA_VISION_MODEL", "qwen3.5:4b")
-
-    answer = llm.generate_multimodal_response("describe", [str(image)])
-
-    assert answer == "a chart"
-    assert captured.get("model") == "qwen3.5:4b"
-    assert captured.get("messages", [{}])[0].get("images") == [str(image)]
-
-
-def test_multimodal_failure_is_llm_error(tmp_path, monkeypatch):
-    class _FakeClient:
-        def chat(self, **kwargs):
-            raise RuntimeError("connection refused")
-
-        def list(self):
-            return [_FakeModel()]
-
-        def show(self, model=None):
-            return _FakeShow()
-
-        def close(self):
-            pass
-
-    llm._client = _FakeClient()
-
-    image = tmp_path / "page_1.png"
-
-    image.write_bytes(b"png")
-
-    with pytest.raises(llm.LLMError, match="Image question answering"):
-        llm.generate_multimodal_response("describe", [str(image)])
-
-
-# --------------------------------------------------
-# Configuration and description
-# --------------------------------------------------
-
-def test_describe_active_provider_reports_model():
-    info = llm.describe_active_provider()
-
-    assert info["provider"] == "ollama"
-    assert info["model"] == "gemma4:31b"
-    assert info["vision_provider"] == "ollama"
-
-
-def test_validate_llm_config_reports_unavailable_model(monkeypatch):
-    class _Model:
-        name = "models/some-other-model"
-
-    class _Models:
-        @staticmethod
-        def list():
-            return [_Model()]
-
-    class _FakeClient:
-        def list(self):
-            return _Models().list()
-
-        def show(self, model=None):
-            return _FakeShow()
-
-        def chat(self, **kwargs):
-            return FakeResponse(content="ok")
-
-        def close(self):
-            pass
-
-    # The startup probe uses its own short-timeout client.
-    monkeypatch.setattr(llm, "_get_probe_client", lambda: _FakeClient())
-
-    validation = llm.validate_llm_config()
-
-    assert validation["configured"] is True
-    assert validation["model_available"] is False
-    assert "gemma4:31b" in validation["warning"]
-
-
-def test_validate_llm_config_reports_available_model(monkeypatch):
-    # This test intentionally configures the Ollama module only.
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_TEXT_MODEL", raising=False)
-    monkeypatch.setenv("OLLAMA_TEXT_MODEL", "my-model:latest")
-
-    class _AvailableModel:
-        # The backend reports exactly the configured model tag.
-        name = "models/my-model"
-
-    class _FakeClient:
-        def list(self):
-            return [_AvailableModel()]
-
-        def show(self, model=None):
-            return _FakeShow()
-
-        def chat(self, **kwargs):
-            response = type("FakeResponse", (), {})()
-            response.message = type("FakeMessage", (), {})()
-            response.message.content = "ok"
-            return response
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(llm, "_get_probe_client", lambda: _FakeClient())
-
-    validation = llm.validate_llm_config()
-
-    assert validation["model_available"] is True
-    assert validation["warning"] is None
-
-
-def test_validate_llm_config_caches_a_definitive_result(monkeypatch):
-    calls = []
-
-    class _FakeClient:
-        def list(self):
-            calls.append("list")
-            return [_FakeModel()]
-
-        def show(self, model=None):
-            return _FakeShow()
-
-    monkeypatch.setattr(llm, "_get_probe_client", lambda: _FakeClient())
-    monkeypatch.setenv("OLLAMA_TEXT_MODEL", "gemma4:31b")
-    monkeypatch.delenv("OLLAMA_HOST", raising=False)
-
-    first = llm.validate_llm_config()
-    second = llm.validate_llm_config()
-
-    # The probe ran once; the second call reused the cached result.
-    assert calls == ["list"]
-    assert first == second
-
-    # force=True probes again.
-    llm.validate_llm_config(force=True)
-    assert calls == ["list", "list"]
-
-
-def test_transient_probe_failure_is_not_cached(monkeypatch):
-    calls = []
-
-    class _FailingClient:
-        def list(self):
-            calls.append("list")
-            raise ConnectionError("down")
+def test_quota_fallback_failure_is_sanitized(monkeypatch):
+    class QuotaError(RuntimeError):
+        status_code = 429
 
     monkeypatch.setattr(
-        llm, "_get_probe_client", lambda: _FailingClient()
+        llm,
+        "get_chat_model",
+        lambda: FakeChatModel(error=QuotaError("secret quota detail")),
+    )
+    monkeypatch.setattr(llm.time, "sleep", lambda _delay: None)
+    monkeypatch.setenv("LLM_QUOTA_FALLBACK", "ollama")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    monkeypatch.setenv("OLLAMA_TEXT_MODEL", "missing-local-model")
+    monkeypatch.setattr(
+        llm,
+        "_configured_ollama_model",
+        lambda: (_ for _ in ()).throw(
+            llm.LLMError(
+                "local details",
+                code="ollama_model_not_found",
+                provider="ollama",
+            )
+        ),
     )
 
-    first = llm.validate_llm_config()
-    llm.validate_llm_config()
-
-    assert first["model_available"] is None
-    assert "could not be checked" in first["warning"]
-    # A transient failure must not be cached: the backend may recover.
-    assert calls == ["list", "list"]
+    with pytest.raises(llm.LLMError) as caught:
+        llm.generate_response("prompt")
+    assert caught.value.code == "gemini_quota_exhausted"
+    assert "secret" not in str(caught.value)
+    assert "local details" not in str(caught.value)
 
 
-def test_probe_client_uses_a_short_timeout(monkeypatch):
-    captured = {}
+def test_stream_retries_before_output_but_not_after_partial_output(monkeypatch):
+    class TemporaryFailure(RuntimeError):
+        status_code = 503
 
-    def fake_build_client(timeout):
-        captured["timeout"] = timeout
+    class StreamModel:
+        def __init__(self, fail_after_output=False):
+            self.calls = 0
+            self.fail_after_output = fail_after_output
+
+        def stream(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                if self.fail_after_output:
+                    yield FakeMessage("partial")
+                raise TemporaryFailure("private service detail")
+            yield FakeMessage("complete")
+
+    monkeypatch.setattr(llm.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(llm.random, "uniform", lambda low, _high: low)
+
+    recoverable = StreamModel()
+    monkeypatch.setattr(llm, "get_chat_model", lambda: recoverable)
+    assert "".join(llm.stream_response("prompt")) == "complete"
+    assert recoverable.calls == 2
+
+    partial = StreamModel(fail_after_output=True)
+    monkeypatch.setattr(llm, "get_chat_model", lambda: partial)
+    stream = llm.stream_response("prompt")
+    assert next(stream) == "partial"
+    with pytest.raises(llm.LLMError):
+        next(stream)
+    assert partial.calls == 1
+
+
+def test_ollama_health_check_is_mocked_and_model_must_be_present(
+    monkeypatch,
+):
+    import httpx
+
+    class TagsResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "local-test-model"}]}
+
+    requests = []
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, timeout: (
+            requests.append((url, timeout)) or TagsResponse()
+        ),
+    )
+    constructed = []
+
+    class FakeOllama:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langchain_ollama",
+        SimpleNamespace(ChatOllama=FakeOllama),
+    )
+    monkeypatch.setenv("LLM_QUOTA_FALLBACK", "ollama")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434/")
+    monkeypatch.setenv("OLLAMA_TEXT_MODEL", "local-test-model")
+
+    model = llm._configured_ollama_model()
+
+    assert isinstance(model, FakeOllama)
+    assert requests == [("http://localhost:11434/api/tags", 3.0)]
+    assert constructed[0]["model"] == "local-test-model"
+    assert constructed[0]["temperature"] == 0
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (type("AuthError", (RuntimeError,), {"status_code": 401})("secret"), "authentication"),
+        (type("PermissionError", (RuntimeError,), {"status_code": 403})("secret"), "authentication"),
+        (type("TimeoutError", (RuntimeError,), {"status_code": 504})("secret"), "timed out"),
+        (type("NotFoundError", (RuntimeError,), {"status_code": 404})("secret"), "model is unavailable"),
+        (type("InvalidRequest", (RuntimeError,), {"status_code": 400})("secret"), "rejected the request"),
+        (type("ServerFailure", (RuntimeError,), {"status_code": 503})("secret"), "temporary service error"),
+    ],
+)
+def test_http_failures_are_sanitized(error, message):
+    translated = llm._translate_error(error, "Text generation")
+    assert message in str(translated)
+    assert "secret" not in str(translated)
+
+
+def test_stream_yields_live_deltas_and_records_final_usage(monkeypatch):
+    model = FakeChatModel(
+        chunks=[
+            FakeMessage("hello "),
+            FakeMessage(
+                "world",
+                {"input_tokens": 20, "output_tokens": 8, "total_tokens": 28},
+            ),
+        ]
+    )
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
+
+    deltas = list(llm.stream_response("prompt"))
+
+    assert deltas == ["hello ", "world"]
+    assert llm.get_last_request_metadata()["usage"] == {
+        "input_tokens": 20,
+        "output_tokens": 8,
+        "total_tokens": 28,
+    }
+
+
+def test_stream_normalizes_mask_tokens_split_across_chunks(monkeypatch):
+    model = FakeChatModel(
+        chunks=[
+            FakeMessage("Assigned to [PER"),
+            FakeMessage("SON_2] yesterday."),
+        ]
+    )
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
+
+    assert "".join(llm.stream_response("prompt")) == "Assigned to Person B yesterday."
+
+
+def test_stream_rejects_empty_and_translates_transport_error(monkeypatch):
+    monkeypatch.setattr(llm, "get_chat_model", lambda: FakeChatModel())
+    with pytest.raises(llm.LLMError, match="empty response"):
+        list(llm.stream_response("prompt"))
+
+    monkeypatch.setattr(
+        llm,
+        "get_chat_model",
+        lambda: FakeChatModel(error=ConnectionError("private host")),
+    )
+    with pytest.raises(llm.LLMError, match="could not reach"):
+        list(llm.stream_response("prompt"))
+
+
+def test_multimodal_uses_gemini_image_content(monkeypatch, tmp_path):
+    image = tmp_path / "scan.png"
+    image.write_bytes(b"png-data")
+    model = FakeChatModel(FakeMessage("a chart"))
+    monkeypatch.setattr(llm, "get_chat_model", lambda: model)
+
+    assert llm.generate_multimodal_response("Describe it", [str(image)]) == "a chart"
+    message = model.invocations[0][0]
+    image_block = message.content[1]
+    assert image_block["type"] == "image_url"
+    assert image_block["image_url"]["url"] == (
+        "data:image/png;base64," + base64.b64encode(b"png-data").decode("ascii")
+    )
+
+
+def test_multimodal_validates_image_paths(tmp_path):
+    with pytest.raises(ValueError, match="No valid image"):
+        llm.generate_multimodal_response(
+            "Describe it",
+            [str(tmp_path / "missing.png")],
+        )
+
+    text_file = tmp_path / "not-an-image.txt"
+    text_file.write_text("not an image", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported format"):
+        llm.generate_multimodal_response("Describe it", [str(text_file)])
+
+
+def test_gemini_configuration_and_provider_metadata(monkeypatch):
+    assert llm.get_text_model() == "gemini-test-model"
+    assert llm.get_vision_model() == "gemini-test-model"
+    assert llm.get_request_timeout() == llm.DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    info = llm.describe_active_provider()
+    assert info["provider"] == "gemini"
+    assert info["model"] == "gemini-test-model"
+    assert info["vision_provider"] == "gemini"
+    assert llm.validate_llm_config()["configured"] is True
+
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", "45")
+    assert llm.get_request_timeout() == 45
+
+
+@pytest.mark.parametrize("timeout", ["invalid", "0", "-1"])
+def test_invalid_timeout_is_reported(monkeypatch, timeout):
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", timeout)
+    with pytest.raises(llm.LLMError, match="GEMINI_TIMEOUT_SECONDS"):
+        llm.get_request_timeout()
+
+
+def test_missing_key_and_non_gemini_graph_provider_are_reported(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY")
+    with pytest.raises(llm.LLMError, match="GEMINI_API_KEY"):
+        llm.validate_llm_config()
+
+    with pytest.raises(llm.LLMError, match="Gemini only"):
+        llm.build_graph_extraction_llm("ollama")
+
+
+def test_model_cache_rebuilds_for_configuration_change(monkeypatch):
+    import langchain_google_genai
+
+    created = []
+
+    def fake_model(**kwargs):
+        created.append(kwargs)
         return object()
 
-    monkeypatch.setattr(llm, "_build_client", fake_build_client)
-    monkeypatch.setattr(llm, "_probe_client", None)
-    monkeypatch.setattr(llm, "_probe_client_key", None)
+    monkeypatch.setattr(
+        langchain_google_genai,
+        "ChatGoogleGenerativeAI",
+        fake_model,
+    )
 
-    llm._get_probe_client()
+    first = llm.get_chat_model()
+    assert llm.get_chat_model() is first
+    monkeypatch.setenv("GEMINI_TEXT_MODEL", "another-model")
+    second = llm.get_chat_model()
 
-    assert captured["timeout"] == llm.PROBE_TIMEOUT_SECONDS
-    assert llm.PROBE_TIMEOUT_SECONDS < llm.DEFAULT_REQUEST_TIMEOUT_SECONDS
-
-
-def test_request_timeout_is_configurable(monkeypatch):
-    monkeypatch.delenv("OLLAMA_TIMEOUT_SECONDS", raising=False)
-    assert llm.get_request_timeout() == llm.DEFAULT_REQUEST_TIMEOUT_SECONDS
-
-    monkeypatch.setenv("OLLAMA_TIMEOUT_SECONDS", "45")
-    assert llm.get_request_timeout() == 45.0
-
-    # An invalid or non-positive value falls back to the default.
-    monkeypatch.setenv("OLLAMA_TIMEOUT_SECONDS", "not-a-number")
-    assert llm.get_request_timeout() == llm.DEFAULT_REQUEST_TIMEOUT_SECONDS
-
-    monkeypatch.setenv("OLLAMA_TIMEOUT_SECONDS", "0")
-    assert llm.get_request_timeout() == llm.DEFAULT_REQUEST_TIMEOUT_SECONDS
-
-
-
-def test_validate_llm_config_requires_api_key(monkeypatch):
-    # The unit layer must fail closed on a missing/blank model tag.
-    monkeypatch.setattr(llm, "get_text_model", lambda: "")
-
-    with pytest.raises(llm.LLMError, match="OLLAMA_TEXT_MODEL cannot be empty"):
-        llm.validate_llm_config()
+    assert second is not first
+    assert len(created) == 2
+    assert created[0]["api_key"] == "unit-test-key"
+    assert created[0]["request_timeout"] == 300

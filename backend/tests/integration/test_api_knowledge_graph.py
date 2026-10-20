@@ -7,7 +7,9 @@ The missing-configuration test uses the service's own guard.
 import pytest
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.context_engine import graph_service
+from app.context_engine import llm_graph_transformer
 from app.main import app
 
 
@@ -167,6 +169,186 @@ def test_knowledge_graph_reports_missing_configuration(monkeypatch):
 
     assert relationships.status_code == 503
     assert "NEO4J_URI" in relationships.json()["detail"]
+
+
+# --------------------------------------------------
+# Ingestion wiring: the upload route really reaches the LLM transformer
+# --------------------------------------------------
+
+
+class GraphDocument:
+    def __init__(self, nodes, relationships):
+        self.nodes = nodes
+        self.relationships = relationships
+
+
+class PromptRecordingTransformer:
+    def __init__(self):
+        self.calls = []
+
+    def convert_to_graph_documents(self, documents):
+        self.calls.append(list(documents))
+
+        return [
+            GraphDocument(
+                nodes=[{"id": "Ada Lovelace", "type": "Person"}],
+                relationships=[],
+            )
+            for _ in documents
+        ]
+
+
+class WriteRecordingSession:
+    def __init__(self):
+        self.runs = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def run(self, query, **parameters):
+        self.runs.append((query, parameters))
+
+        class _Result:
+            def __iter__(self):
+                return iter(())
+
+            def single(self):
+                if "MERGE (document:Document" in query:
+                    return dict(parameters)
+                if "MERGE (entity:Entity" in query:
+                    return dict(parameters)
+
+                return None
+
+        return _Result()
+
+    def execute_write(self, callback):
+        return callback(self)
+
+
+class WriteRecordingDriver:
+    def __init__(self):
+        self.session_log = WriteRecordingSession()
+
+    def session(self, database=None):
+        return self.session_log
+
+
+def test_upload_ingests_through_the_llm_transformer(
+    tmp_path, monkeypatch
+):
+    """The production upload path must call the LangChain transformer."""
+
+    units = [
+        {
+            "id": "source-unit-2",
+            "content_type": "text",
+            "page_number": 2,
+            "content": "Ada Lovelace worked at Acme Corp.",
+        }
+    ]
+
+    monkeypatch.setattr(main_module, "DOCUMENT_DIR", tmp_path)
+    monkeypatch.setattr(
+        main_module,
+        "process_document",
+        lambda **_kwargs: (
+            units,
+            0,
+            [],
+            [],
+            {"applied": False, "safety_passed": True, "masked_entities": 0},
+        ),
+    )
+    monkeypatch.setattr(graph_service, "is_configured", lambda: True)
+
+    driver = WriteRecordingDriver()
+    monkeypatch.setattr(graph_service, "get_driver", lambda: driver)
+
+    transformer = PromptRecordingTransformer()
+    monkeypatch.setattr(
+        llm_graph_transformer,
+        "build_transformer",
+        lambda **_kwargs: transformer,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/documents/upload",
+            files={"file": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        )
+
+        assert response.status_code == 202, response.text
+        job = client.get(
+            f"/documents/jobs/{response.json()['job_id']}"
+        ).json()
+        assert job["status"] == "completed", job
+
+    body = {
+        "document_id": job["document_id"],
+        **job["result"],
+    }
+
+    assert body["knowledge_graph"]["ingested"] is True
+    assert body["knowledge_graph"]["error"] is None
+    assert body["knowledge_graph"]["entities"] == 1
+
+    # The model really ran, on the page text with its provenance intact.
+    assert len(transformer.calls) == 1
+    sent = transformer.calls[0][0]
+    assert sent.page_content == "Ada Lovelace worked at Acme Corp."
+    assert sent.metadata["page_number"] == 2
+    assert sent.metadata["document_id"] == body["document_id"]
+    assert sent.metadata["source_unit_id"] == "source-unit-2"
+
+    # And the validated node reached Neo4j with page provenance.
+    mention_runs = [
+        parameters
+        for query, parameters in driver.session_log.runs
+        if "[mention:MENTIONS]" in query and "entity_id" in parameters
+    ]
+
+    assert len(mention_runs) == 1
+    assert mention_runs[0]["entity_id"] == "person:ada_lovelace"
+    assert mention_runs[0]["page_numbers"] == [2]
+    assert mention_runs[0]["document_id"] == body["document_id"]
+    assert mention_runs[0]["source_refs"] == [
+        f"{body['document_id']}#page=2#unit=source-unit-2"
+    ]
+
+
+def test_document_graph_endpoint_returns_entities_and_edges(monkeypatch):
+    monkeypatch.setattr(
+        main_module,
+        "find_document_graph",
+        lambda document_id: {
+            "document_id": document_id,
+            "entities": ENTITY_RECORDS,
+            "edges": [
+                {
+                    "source_id": "entity-1",
+                    "source": "Heart",
+                    "relationship": "RELATES_TO",
+                    "target_id": "entity-2",
+                    "target": "Lung",
+                }
+            ],
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/knowledge-graph/documents/doc-1/graph")
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["document_id"] == "doc-1"
+    assert body["entities"] == ENTITY_RECORDS
+    assert body["edges"][0]["relationship"] == "RELATES_TO"
 
 
 def test_entity_limit_is_validated():

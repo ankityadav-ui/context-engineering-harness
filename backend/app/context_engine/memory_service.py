@@ -136,6 +136,16 @@ def delete_memory(
     return True
 
 
+def count_memories(db: Session, user_id: str) -> int:
+    """Return the number of memories owned by one user."""
+
+    return (
+        db.query(Memory)
+        .filter(Memory.user_id == user_id)
+        .count()
+    )
+
+
 def retrieve_relevant_memories(
     db: Session,
     user_id: str,

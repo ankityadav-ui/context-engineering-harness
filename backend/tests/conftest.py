@@ -19,6 +19,29 @@ import app.context_engine.models  # noqa: F401
 from app.main import app, get_db, get_db_optional
 
 
+@pytest.fixture(autouse=True)
+def mock_gemini_configuration(monkeypatch):
+    """Keep the test suite independent of local credentials and .env."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_TEXT_MODEL", "gemini-test-model")
+    monkeypatch.setenv("INGESTION_JOB_RECOVERY_ENABLED", "false")
+
+
+@pytest.fixture(autouse=True)
+def isolate_ingestion_job_store(monkeypatch, sqlite_session_factory):
+    """Keep durable job tests in the shared in-memory test database."""
+    from app.context_engine import ingestion_jobs
+    from app import main
+
+    monkeypatch.setattr(ingestion_jobs, "SessionLocal", sqlite_session_factory)
+
+    class InlineExecutor:
+        def submit(self, callback):
+            callback()
+
+    monkeypatch.setattr(main, "_INGESTION_EXECUTOR", InlineExecutor())
+
+
 @pytest.fixture()
 def sqlite_session_factory():
     """A session factory bound to one shared in-memory SQLite database."""
@@ -45,8 +68,10 @@ def sqlite_session_factory():
 
 
 @pytest.fixture()
-def api_client(sqlite_session_factory):
+def api_client(sqlite_session_factory, monkeypatch):
     """A TestClient whose storage dependency is an in-memory database."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_TEXT_MODEL", "gemini-test-model")
 
     def override_get_db():
         db = sqlite_session_factory()
